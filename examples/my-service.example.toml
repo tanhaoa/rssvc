@@ -1,0 +1,33 @@
+# rssvc 服务配置示例（rssvc export 生成的格式，可手改后 import）
+# 用法: rssvc import <服务名> my-service.toml
+
+application = 'C:\Program Files\nodejs\node.exe'
+app_directory = 'C:\myapp'
+app_parameters = 'server.js --port 3000'
+
+# 日志: stdout/stderr 可同路径（共用一个写入器），留空 = 丢弃输出
+stdout = 'C:\logs\my-service.out.log'
+stderr = 'C:\logs\my-service.err.log'
+rotate_bytes = 10485760   # 10 MiB；0 = 仅按日期轮转
+rotate_keep = 10          # 保留 10 份归档；0 = 全部保留
+
+environment = ['NODE_ENV=production', 'PORT=3000']
+
+priority = 32             # NORMAL；其他: 64 IDLE, 16384 BELOW_NORMAL, 32768 ABOVE_NORMAL, 128 HIGH, 256 REALTIME
+startup = 2               # 2 = 自动, 3 = 手动
+delayed_autostart = false # true = 开机延迟自启（仅 startup=2 有效）
+
+# 停止策略
+stop_method_skip = 0      # 位掩码: 1 跳过控制台 2 跳过窗口 4 跳过线程 8 跳过强杀
+stop_timeout_console = 1500
+stop_timeout_window = 1500
+stop_timeout_threads = 1500
+
+# 重启策略
+restart_delay_ms = 1000
+throttle_ms = 1500
+max_restarts = 10
+
+display_name = 'My Service'
+description = '示例：由 rssvc 托管的 Node.js 服务'
+dependencies = []
