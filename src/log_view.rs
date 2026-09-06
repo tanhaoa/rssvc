@@ -17,13 +17,13 @@ use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Controls::{EM_REPLACESEL, EM_SCROLLCARET, EM_SETLIMITTEXT, EM_SETSEL, BST_CHECKED};
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DestroyWindow, GetWindowLongPtrW, KillTimer, LoadCursorW,
-    MoveWindow, RegisterClassExW, SendMessageW, SetForegroundWindow, SetTimer,
-    SetWindowLongPtrW, ShowWindow, BM_GETCHECK, CB_ADDSTRING, CB_GETCURSEL, CB_SETCURSEL,
-    CBN_SELCHANGE, GWLP_USERDATA, IDC_ARROW, MB_ICONERROR, MB_ICONINFORMATION, MB_OK, SW_SHOW,
-    WM_CLOSE, WM_COMMAND, WM_DESTROY, WM_GETTEXTLENGTH, WM_SETFONT, WM_SIZE, WM_TIMER,
-    WINDOW_EX_STYLE, WINDOW_STYLE, WNDCLASSEXW, WS_CAPTION, WS_CHILD, WS_EX_CLIENTEDGE,
-    WS_SYSMENU, WS_TABSTOP, WS_VSCROLL, WS_VISIBLE,
+    CBS_DROPDOWNLIST, CreateWindowExW, DefWindowProcW, DestroyWindow, GetWindowLongPtrW,
+    KillTimer, LoadCursorW, MoveWindow, RegisterClassExW, SendMessageW, SetForegroundWindow,
+    SetTimer, SetWindowLongPtrW, ShowWindow, BM_GETCHECK, CB_ADDSTRING, CB_GETCURSEL,
+    CB_SETCURSEL, CBN_SELCHANGE, GWLP_USERDATA, IDC_ARROW, MB_ICONERROR, MB_ICONINFORMATION,
+    MB_OK, SW_SHOW, WM_CLOSE, WM_COMMAND, WM_DESTROY, WM_GETTEXTLENGTH, WM_SETFONT, WM_SIZE,
+    WM_TIMER, WINDOW_EX_STYLE, WINDOW_STYLE, WNDCLASSEXW, WS_CAPTION, WS_CHILD,
+    WS_EX_CLIENTEDGE, WS_SYSMENU, WS_TABSTOP, WS_VSCROLL, WS_VISIBLE,
 };
 
 use crate::config::Config;
@@ -40,8 +40,8 @@ const INITIAL_TAIL: u64 = 64 * 1024; // first-open window
 const JUMP_THRESHOLD: u64 = 1024 * 1024; // snap-to-tail threshold
 const JUMP_TAIL: u64 = 256 * 1024;
 
-const VIEW_W: i32 = 880;
-const VIEW_H: i32 = 580;
+const VIEW_W: i32 = 880; // desired CLIENT area width
+const VIEW_H: i32 = 580; // desired CLIENT area height
 
 struct Stream {
     path: PathBuf,
@@ -98,7 +98,8 @@ pub fn open_log_viewer(owner: HWND, name: &str, cfg: &Config) {
         let hinstance = HINSTANCE(hmodule.0);
         register_class(hinstance);
 
-        let (x, y) = ctl::center_on(owner, VIEW_W, VIEW_H);
+        let (outer_w, outer_h) = ctl::outer_size_for_client(VIEW_W, VIEW_H);
+        let (x, y) = ctl::center_on(owner, outer_w, outer_h);
         let title = windows::core::HSTRING::from(format!("实时日志 - {name} - rssvc"));
         let hwnd = match CreateWindowExW(
             WINDOW_EX_STYLE(0),
@@ -107,8 +108,8 @@ pub fn open_log_viewer(owner: HWND, name: &str, cfg: &Config) {
             WINDOW_STYLE(WS_CAPTION.0 | WS_SYSMENU.0),
             x,
             y,
-            VIEW_W,
-            VIEW_H,
+            outer_w,
+            outer_h,
             Some(owner),
             None,
             Some(hinstance),
@@ -170,7 +171,12 @@ unsafe fn create_controls(lv: &mut LogView, hinstance: HINSTANCE) {
         WINDOW_EX_STYLE(0),
         w!("COMBOBOX"),
         w!(""),
-        WINDOW_STYLE(WS_CHILD.0 | WS_VISIBLE.0 | WS_TABSTOP.0 | WS_VSCROLL.0),
+        // CBS_DROPDOWNLIST is mandatory: without it Win32 falls back to
+        // CBS_SIMPLE (list always expanded) which covers the log area.
+        WINDOW_STYLE(
+            WS_CHILD.0 | WS_VISIBLE.0 | WS_TABSTOP.0 | WS_VSCROLL.0
+                | CBS_DROPDOWNLIST as u32,
+        ),
         56, 8, 560, 200,
         Some(f.hwnd), Some(HMENU_ID(ID_FILE)), Some(hinstance), None,
     ) {

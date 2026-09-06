@@ -200,7 +200,11 @@ pub fn spawn(cfg: &Config, logger: &Logger) -> Result<Child, String> {
         };
 
         // Environment block.
-        let env_block = build_env_block(&cfg.environment);
+        // Both env lists apply on top of the inherited environment
+        // (AppEnvironment first, then AppEnvironmentExtra).
+        let mut env: Vec<String> = cfg.environment.clone();
+        env.extend(cfg.environment_extra.iter().cloned());
+        let env_block = build_env_block(&env);
 
         let flags: PROCESS_CREATION_FLAGS = CREATE_SUSPENDED
             | CREATE_NEW_PROCESS_GROUP

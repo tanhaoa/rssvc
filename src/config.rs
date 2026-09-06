@@ -76,9 +76,15 @@ pub struct Config {
     /// Number of archived log files to keep (0 = keep all).
     #[serde(default = "d_rotate_keep")]
     pub rotate_keep: u32,
-    /// Extra environment variables in KEY=VALUE form.
+    /// Extra environment variables in KEY=VALUE form (written to the
+    /// `AppEnvironment` REG_MULTI_SZ value; NSSM-compatible).
     #[serde(default)]
     pub environment: Vec<String>,
+    /// Additional environment variables in KEY=VALUE form (written to the
+    /// `AppEnvironmentExtra` REG_MULTI_SZ value; the location NSSM itself
+    /// prefers). Applied on top of `environment` at spawn time.
+    #[serde(default)]
+    pub environment_extra: Vec<String>,
     /// Process priority class (Win32 value, see constants above).
     #[serde(default = "d_priority")]
     pub priority: u32,
@@ -132,6 +138,7 @@ impl Default for Config {
             rotate_bytes: DEFAULT_ROTATE_BYTES,
             rotate_keep: DEFAULT_ROTATE_KEEP,
             environment: Vec::new(),
+            environment_extra: Vec::new(),
             priority: PRIORITY_NORMAL,
             startup: START_AUTO,
             delayed_autostart: false,
@@ -159,6 +166,19 @@ fn parameters_key_path(name: &str) -> String {
     format!(r"SYSTEM\CurrentControlSet\Services\{name}\Parameters")
 }
 
+/// Write a REG_MULTI_SZ, or delete the value when the list is empty.
+///
+/// NSSM treats an *empty* `AppEnvironment` as "clear the whole environment",
+/// so an empty list must delete the value rather than write an empty array.
+fn set_or_delete_multi(key: &RegKey, name: &str, vals: &[String]) -> std::io::Result<()> {
+    if vals.is_empty() {
+        let _ = key.delete_value(name); // missing value is fine
+        Ok(())
+    } else {
+        key.set_value(name, &vals.to_vec())
+    }
+}
+
 impl Config {
     /// Load the configuration of `name` from the registry.
     pub fn load(name: &str) -> std::io::Result<Config> {
@@ -183,6 +203,9 @@ impl Config {
             rotate_keep: u("AppRotateKeep", DEFAULT_ROTATE_KEEP),
             environment: key
                 .get_value::<Vec<String>, _>("AppEnvironment")
+                .unwrap_or_default(),
+            environment_extra: key
+                .get_value::<Vec<String>, _>("AppEnvironmentExtra")
                 .unwrap_or_default(),
             priority: u("AppPriority", PRIORITY_NORMAL),
             startup: svc
@@ -232,7 +255,8 @@ impl Config {
         key.set_value("AppStderr", &self.stderr)?;
         key.set_value("AppRotateBytes", &self.rotate_bytes)?;
         key.set_value("AppRotateKeep", &self.rotate_keep)?;
-        key.set_value("AppEnvironment", &self.environment)?;
+        set_or_delete_multi(&key, "AppEnvironment", &self.environment)?;
+        set_or_delete_multi(&key, "AppEnvironmentExtra", &self.environment_extra)?;
         key.set_value("AppPriority", &self.priority)?;
         key.set_value("AppStopMethodSkip", &self.stop_method_skip)?;
         key.set_value("AppStopMethodConsole", &self.stop_timeout_console)?;
@@ -318,8 +342,14 @@ pub fn print_config(name: &str, c: &Config) {
     println!("工作目录:      {}", c.app_directory);
     println!("启动参数:      {}", c.app_parameters);
     if !c.environment.is_empty() {
-        println!("环境变量:");
+        println!("环境变量 (AppEnvironment):");
         for e in &c.environment {
+            println!("  {e}");
+        }
+    }
+    if !c.environment_extra.is_empty() {
+        println!("追加环境变量 (AppEnvironmentExtra):");
+        for e in &c.environment_extra {
             println!("  {e}");
         }
     }
@@ -346,4 +376,80 @@ pub fn print_config(name: &str, c: &Config) {
     if !c.dependencies.is_empty() {
         println!("依赖服务:      {}", c.dependencies.join(", "));
     }
+    let others = raw_other_values(name);
+    if !others.is_empty() {
+        println!("其他参数:      (未由 rssvc 管理, 原样保留)");
+        for (k, v) in &others {
+            println!("  {k} = {v}");
+        }
+    }
+}
+
+/// Parameter keys that rssvc models explicitly. Everything else found under
+/// `Parameters` (NSSM extras such as `AppExit`, `AppNoConsole`,
+/// `AppRotateOnline`, `AppStdoutCreationDisposition`, ...) is surfaced
+/// verbatim by `raw_other_values` so nothing is ever hidden in the GUI.
+pub const MODELED_PARAMETER_KEYS: &[&str] = &[
+    "Application",
+    "AppDirectory",
+    "AppParameters",
+    "AppStdout",
+    "AppStderr",
+    "AppRotateBytes",
+    "AppRotateKeep",
+    "AppEnvironment",
+    "AppEnvironmentExtra",
+    "AppPriority",
+    "AppStopMethodSkip",
+    "AppStopMethodConsole",
+    "AppStopMethodWindow",
+    "AppStopMethodThreads",
+    "AppRestartDelay",
+    "AppThrottle",
+    "AppMaxRestarts",
+];
+
+/// Read every value under `Parameters` that rssvc does not model, formatted
+/// as display strings (read-only; never written back).
+pub fn raw_other_values(name: &str) -> Vec<(String, String)> {
+    let hk = RegKey::predef(HKEY_LOCAL_MACHINE);
+    let Ok(key) = hk.open_subkey_with_flags(parameters_key_path(name), KEY_READ) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for vname in key.enum_values().flatten().map(|(n, _)| n) {
+        if MODELED_PARAMETER_KEYS.iter().any(|k| k.eq_ignore_ascii_case(&vname)) {
+            continue;
+        }
+        let Ok(raw) = key.get_raw_value(&vname) else { continue };
+        let text = match raw.vtype {
+            REG_MULTI_SZ => multi_sz_to_strings(&raw.bytes),
+            REG_BINARY => raw
+                .bytes
+                .iter()
+                .map(|x| format!("{x:02X}"))
+                .collect::<Vec<_>>()
+                .join(" "),
+            // RegValue implements Display for SZ / EXPAND_SZ / DWORD / QWORD.
+            _ => raw.to_string(),
+        };
+        out.push((vname, text));
+    }
+    out.sort_by(|a, b| a.0.to_lowercase().cmp(&b.0.to_lowercase()));
+    out
+}
+
+/// Decode a REG_MULTI_SZ blob (UTF-16LE, NUL-terminated entries) into a
+/// display string joined by ` | `.
+fn multi_sz_to_strings(bytes: &[u8]) -> String {
+    let units: Vec<u16> = bytes
+        .chunks_exact(2)
+        .map(|c| u16::from_le_bytes([c[0], c[1]]))
+        .collect();
+    units
+        .split(|&u| u == 0)
+        .filter(|s| !s.is_empty())
+        .map(String::from_utf16_lossy)
+        .collect::<Vec<_>>()
+        .join(" | ")
 }

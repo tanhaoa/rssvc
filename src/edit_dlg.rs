@@ -52,13 +52,16 @@ const ID_TMO_C: u32 = 15;
 const ID_TMO_W: u32 = 16;
 const ID_TMO_T: u32 = 17;
 const ID_ENV: u32 = 18;
+const ID_ENV_EXTRA: u32 = 19;
 const ID_OK: u32 = 20;
 const ID_CANCEL: u32 = 21;
 const ID_BROWSE_APP: u32 = 30;
 const ID_BROWSE_DIR: u32 = 31;
 
+// Desired CLIENT area size; the outer window size is computed from it via
+// AdjustWindowRectEx (title bar + borders would otherwise crop the form).
 const DLG_W: i32 = 720;
-const DLG_H: i32 = 668;
+const DLG_H: i32 = 642;
 
 struct EditState {
     owner: HWND,
@@ -75,7 +78,8 @@ pub fn open_edit_dialog(owner: HWND, name: String, cfg: Config) {
         let hinstance = HINSTANCE(hmodule.0);
         register_class(hinstance);
 
-        let (x, y) = ctl::center_on(owner, DLG_W, DLG_H);
+        let (outer_w, outer_h) = ctl::outer_size_for_client(DLG_W, DLG_H);
+        let (x, y) = ctl::center_on(owner, outer_w, outer_h);
         let title = windows::core::HSTRING::from(format!("rssvc - 编辑服务配置 [{name}]"));
         let hwnd = match CreateWindowExW(
             WINDOW_EX_STYLE(0),
@@ -84,8 +88,8 @@ pub fn open_edit_dialog(owner: HWND, name: String, cfg: Config) {
             WINDOW_STYLE(WS_CAPTION.0 | WS_SYSMENU.0),
             x,
             y,
-            DLG_W,
-            DLG_H,
+            outer_w,
+            outer_h,
             Some(owner),
             None,
             Some(hinstance),
@@ -130,8 +134,9 @@ fn register_class(hinstance: HINSTANCE) {
 
 unsafe fn create_form(st: &mut EditState, hinstance: HINSTANCE) {
     let f = &mut st.form;
-    let full_w = DLG_W - 34; // margins 14 + 20
+    let full_w = DLG_W - 28; // client margins 14 + 14
     let half_w = (full_w - 20) / 2;
+    let right_edge = DLG_W - 14; // right client margin
 
     f.label(hinstance, "服务名（不可修改）", 14, 8, 400);
     let name_h = util::to_wide(&st.name);
@@ -156,14 +161,14 @@ unsafe fn create_form(st: &mut EditState, hinstance: HINSTANCE) {
 
     f.label(hinstance, "应用程序 *", 14, 142, 400);
     f.edit(hinstance, ID_APP, 14, 158, full_w - 118);
-    f.button(hinstance, ID_BROWSE_APP, "浏览...", DLG_W - 14 - 104, 157, 104, 26, false);
+    f.button(hinstance, ID_BROWSE_APP, "浏览...", right_edge - 104, 157, 104, 26, false);
 
     f.label(hinstance, "启动参数 (可选)", 14, 192, 400);
     f.edit(hinstance, ID_ARGS, 14, 208, full_w);
 
     f.label(hinstance, "工作目录 (可选, 默认: 程序所在目录)", 14, 238, 400);
     f.edit(hinstance, ID_DIR, 14, 254, full_w - 118);
-    f.button(hinstance, ID_BROWSE_DIR, "浏览...", DLG_W - 14 - 104, 253, 104, 26, false);
+    f.button(hinstance, ID_BROWSE_DIR, "浏览...", right_edge - 104, 253, 104, 26, false);
 
     f.label(hinstance, "stdout 日志 (可选)", 14, 288, 280);
     f.label(hinstance, "stderr 日志 (可选)", 14 + half_w + 20, 288, 280);
@@ -202,11 +207,19 @@ unsafe fn create_form(st: &mut EditState, hinstance: HINSTANCE) {
     f.label(hinstance, "线程", 394, 432, 40);
     f.edit(hinstance, ID_TMO_T, 436, 428, 80);
 
-    f.label(hinstance, "环境变量 (每行一个 KEY=VALUE, # 开头行忽略)", 14, 462, 500);
-    f.edit_ml(hinstance, ID_ENV, 14, 478, full_w, 120, false);
+    f.label(hinstance, "环境变量 AppEnvironment (替换式, 通常留空; 每行 KEY=VALUE, # 注释)", 14, 462, half_w);
+    f.edit_ml(hinstance, ID_ENV, 14, 480, half_w, 110, false);
+    f.label(
+        hinstance,
+        "追加环境变量 AppEnvironmentExtra (推荐; 每行 KEY=VALUE, # 注释)",
+        14 + half_w + 20,
+        462,
+        half_w,
+    );
+    f.edit_ml(hinstance, ID_ENV_EXTRA, 14 + half_w + 20, 480, half_w, 110, false);
 
-    f.button(hinstance, ID_OK, "保存", DLG_W - 14 - 224, 618, 104, 30, true);
-    f.button(hinstance, ID_CANCEL, "取消", DLG_W - 14 - 104, 618, 104, 30, false);
+    f.button(hinstance, ID_OK, "保存", right_edge - 224, 604, 104, 30, true);
+    f.button(hinstance, ID_CANCEL, "取消", right_edge - 104, 604, 104, 30, false);
 }
 
 fn prefill(form: &Form, cfg: &Config) {
@@ -248,6 +261,7 @@ fn prefill(form: &Form, cfg: &Config) {
     form.set_text(ID_TMO_W, &cfg.stop_timeout_window.to_string());
     form.set_text(ID_TMO_T, &cfg.stop_timeout_threads.to_string());
     form.set_text(ID_ENV, &cfg.environment.join("\r\n"));
+    form.set_text(ID_ENV_EXTRA, &cfg.environment_extra.join("\r\n"));
 }
 
 // ------------------------------------------------------------ wndproc ----
@@ -311,21 +325,6 @@ fn parse_num(field: &str, s: &str, current: u32) -> Result<u32, String> {
         .map_err(|_| format!("{field} 必须是非负整数，当前输入: \"{t}\""))
 }
 
-fn parse_env(s: &str) -> Result<Vec<String>, String> {
-    let mut out = Vec::new();
-    for line in s.lines() {
-        let l = line.trim();
-        if l.is_empty() || l.starts_with('#') {
-            continue;
-        }
-        if !l.contains('=') || l.split('=').next().unwrap_or("").trim().is_empty() {
-            return Err(format!("环境变量格式错误（应为 KEY=VALUE）: {l}"));
-        }
-        out.push(l.to_string());
-    }
-    Ok(out)
-}
-
 fn on_save(st: &mut EditState) {
     let form = &st.form;
     let name = st.name.clone();
@@ -378,7 +377,11 @@ fn on_save(st: &mut EditState) {
         Ok(v) => v,
         Err(e) => return msg_box(st.hwnd(), &e, "rssvc", MB_OK | MB_ICONERROR),
     };
-    let environment = match parse_env(&form.text(ID_ENV)) {
+    let environment = match ctl::parse_env_text(&form.text(ID_ENV)) {
+        Ok(v) => v,
+        Err(e) => return msg_box(st.hwnd(), &e, "rssvc", MB_OK | MB_ICONERROR),
+    };
+    let environment_extra = match ctl::parse_env_text(&form.text(ID_ENV_EXTRA)) {
         Ok(v) => v,
         Err(e) => return msg_box(st.hwnd(), &e, "rssvc", MB_OK | MB_ICONERROR),
     };
@@ -411,6 +414,7 @@ fn on_save(st: &mut EditState) {
     cfg.stop_timeout_window = stop_timeout_window;
     cfg.stop_timeout_threads = stop_timeout_threads;
     cfg.environment = environment;
+    cfg.environment_extra = environment_extra;
     let su = form.combo_sel(ID_STARTUP, 0);
     cfg.startup = if su == 2 { START_MANUAL } else { START_AUTO };
     cfg.delayed_autostart = su == 1;

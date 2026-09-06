@@ -613,6 +613,17 @@ fn detail_text(e: &SvcEntry) -> String {
         if !c.app_parameters.is_empty() {
             s.push_str(&format!("启动参数:  {}\r\n", c.app_parameters));
         }
+        for (label, list) in [
+            ("环境变量", &c.environment),
+            ("追加环境变量", &c.environment_extra),
+        ] {
+            if !list.is_empty() {
+                s.push_str(&format!("{label}:\r\n"));
+                for e in list {
+                    s.push_str(&format!("    {e}\r\n"));
+                }
+            }
+        }
         if !c.stdout.is_empty() {
             s.push_str(&format!("stdout:    {}\r\n", c.stdout));
         }
@@ -628,8 +639,24 @@ fn detail_text(e: &SvcEntry) -> String {
             "重启策略:  延迟 {} ms / 节流阈值 {} ms / 最大连续重启 {} 次\r\n",
             c.restart_delay_ms, c.throttle_ms, c.max_restarts
         ));
+        s.push_str(&format!(
+            "停止策略:  跳过掩码 {} / 超时 {}-{}-{} ms (控制台-窗口-线程)\r\n",
+            c.stop_method_skip, c.stop_timeout_console, c.stop_timeout_window, c.stop_timeout_threads
+        ));
+        if !c.dependencies.is_empty() {
+            s.push_str(&format!("依赖服务:  {}\r\n", c.dependencies.join(", ")));
+        }
         if !c.description.is_empty() {
             s.push_str(&format!("描述:      {}\r\n", c.description));
+        }
+        // Catch-all: NSSM-only parameters we do not model are shown verbatim
+        // so nothing installed by nssm is ever invisible.
+        let others = crate::config::raw_other_values(&e.name);
+        if !others.is_empty() {
+            s.push_str("其他参数 (未由 rssvc 管理, 原样保留):\r\n");
+            for (k, v) in &others {
+                s.push_str(&format!("    {k} = {v}\r\n"));
+            }
         }
     }
     s

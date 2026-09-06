@@ -41,10 +41,18 @@ const ID_STDOUT: u32 = 6;
 const ID_STDERR: u32 = 7;
 const ID_STARTUP: u32 = 8;
 const ID_PRIORITY: u32 = 9;
+const ID_ENV: u32 = 12;
 const ID_OK: u32 = 10;
 const ID_CANCEL: u32 = 11;
 const ID_BROWSE_APP: u32 = 30;
 const ID_BROWSE_DIR: u32 = 31;
+
+// Desired CLIENT area size (outer size computed via AdjustWindowRectEx).
+const DLG_W: i32 = 660;
+const DLG_H: i32 = 548;
+// Desired CLIENT area size of the TOML-import service-name prompt.
+const PROMPT_W: i32 = 464;
+const PROMPT_H: i32 = 142;
 
 struct DlgState {
     owner: HWND,
@@ -66,8 +74,9 @@ pub fn open_install_dialog(owner: HWND) {
         let hinstance = HINSTANCE(hmodule.0);
         register_class(hinstance);
 
-        // Center on the owner window.
-        let (x, y) = ctl::center_on(owner, 660, 470);
+        // Center on the owner window (outer size from desired client size).
+        let (outer_w, outer_h) = ctl::outer_size_for_client(DLG_W, DLG_H);
+        let (x, y) = ctl::center_on(owner, outer_w, outer_h);
         let hwnd = match CreateWindowExW(
             WINDOW_EX_STYLE(0),
             w!("rssvcInstallWnd"),
@@ -75,8 +84,8 @@ pub fn open_install_dialog(owner: HWND) {
             WINDOW_STYLE(WS_CAPTION.0 | WS_SYSMENU.0),
             x,
             y,
-            660,
-            470,
+            outer_w,
+            outer_h,
             Some(owner),
             None,
             Some(hinstance),
@@ -106,7 +115,8 @@ pub fn prompt_name_and_install(owner: HWND, cfg: Config) {
         let hinstance = HINSTANCE(hmodule.0);
         register_prompt_class(hinstance);
 
-        let (x, y) = ctl::center_on(owner, 480, 180);
+        let (outer_w, outer_h) = ctl::outer_size_for_client(PROMPT_W, PROMPT_H);
+        let (x, y) = ctl::center_on(owner, outer_w, outer_h);
         let hwnd = match CreateWindowExW(
             WINDOW_EX_STYLE(0),
             w!("rssvcPromptWnd"),
@@ -114,8 +124,8 @@ pub fn prompt_name_and_install(owner: HWND, cfg: Config) {
             WINDOW_STYLE(WS_CAPTION.0 | WS_SYSMENU.0),
             x,
             y,
-            480,
-            180,
+            outer_w,
+            outer_h,
             Some(owner),
             None,
             Some(hinstance),
@@ -132,10 +142,10 @@ pub fn prompt_name_and_install(owner: HWND, cfg: Config) {
         });
         unsafe fn build(st: &mut PromptState, hinstance: HINSTANCE) {
             let f = &mut st.form;
-            f.label(hinstance, "服务名 *（将创建一个新服务）", 16, 12, 420);
-            f.edit(hinstance, ID_NAME, 16, 32, 440);
-            f.button(hinstance, ID_OK, "安装", 244, 96, 104, 30, true);
-            f.button(hinstance, ID_CANCEL, "取消", 356, 96, 104, 30, false);
+            f.label(hinstance, "服务名 *（将创建一个新服务）", 16, 10, 420);
+            f.edit(hinstance, ID_NAME, 16, 28, 432);
+            f.button(hinstance, ID_OK, "安装", 244, 98, 104, 30, true);
+            f.button(hinstance, ID_CANCEL, "取消", 356, 98, 104, 30, false);
         }
         build(&mut st, hinstance);
         SetWindowLongPtrW(hwnd, GWLP_USERDATA, Box::into_raw(st) as isize);
@@ -208,21 +218,29 @@ unsafe fn create_form(st: &mut DlgState, hinstance: HINSTANCE) {
     f.edit(hinstance, ID_STDOUT, 14, 300, 316);
     f.edit(hinstance, ID_STDERR, 344, 300, 286);
     // Combos.
-    f.label(hinstance, "启动类型", 14, 342, 64);
-    f.combo(hinstance, ID_STARTUP, 82, 338, 170, &["自动", "自动（延迟启动）", "手动"], 0);
-    f.label(hinstance, "进程优先级", 300, 342, 76);
+    f.label(hinstance, "启动类型", 14, 338, 64);
+    f.combo(hinstance, ID_STARTUP, 82, 334, 170, &["自动", "自动（延迟启动）", "手动"], 0);
+    f.label(hinstance, "进程优先级", 300, 338, 76);
     f.combo(
         hinstance,
         ID_PRIORITY,
         380,
-        338,
+        334,
         170,
         &["实时", "高", "高于标准", "标准", "低于标准", "空闲"],
         3,
     );
+    // Environment variables (written to AppEnvironmentExtra, NSSM's
+    // recommended location).
+    f.label(
+        hinstance,
+        "环境变量 (可选; 每行一个 KEY=VALUE, # 开头行忽略; 追加在系统环境之上)",
+        14, 376, 600,
+    );
+    f.edit_ml(hinstance, ID_ENV, 14, 394, DLG_W - 28, 92, false);
     // Buttons.
-    f.button(hinstance, ID_OK, "安装", 424, 384, 104, 30, true);
-    f.button(hinstance, ID_CANCEL, "取消", 536, 384, 104, 30, false);
+    f.button(hinstance, ID_OK, "安装", DLG_W - 14 - 224, 498, 104, 30, true);
+    f.button(hinstance, ID_CANCEL, "取消", DLG_W - 14 - 104, 498, 104, 30, false);
 }
 
 // ---------------------------------------------------------------- wndproc ----
@@ -393,6 +411,15 @@ fn on_ok(st: &mut DlgState) {
     ][pr.min(5)];
     let display = st.form.text(ID_DISPLAY);
     cfg.display_name = if display.is_empty() { name.clone() } else { display };
+    // Environment: AppEnvironmentExtra (NSSM's recommended location); the
+    // shared runner also merges it on top of AppEnvironment at spawn time.
+    match ctl::parse_env_text(&st.form.text(ID_ENV)) {
+        Ok(v) => cfg.environment_extra = v,
+        Err(e) => {
+            msg_box(st.form.hwnd, &e, "rssvc", MB_OK | MB_ICONERROR);
+            return;
+        }
+    }
 
     match install_service(&name, &cfg) {
         Ok(()) => {

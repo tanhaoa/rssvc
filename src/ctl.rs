@@ -16,13 +16,14 @@ use windows::Win32::UI::Shell::{
     FOS_PICKFOLDERS, IFileOpenDialog, IFileSaveDialog, SIGDN_FILESYSPATH,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, GetWindowRect, SendMessageW, WINDOW_EX_STYLE, WINDOW_STYLE, WS_CHILD,
-    WS_EX_CLIENTEDGE, WS_TABSTOP, WS_VISIBLE, WS_VSCROLL,
+    AdjustWindowRectEx, CreateWindowExW, GetWindowRect, SendMessageW, WINDOW_EX_STYLE,
+    WINDOW_STYLE, WS_CAPTION, WS_CHILD, WS_EX_CLIENTEDGE, WS_SYSMENU, WS_TABSTOP, WS_VISIBLE,
+    WS_VSCROLL,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     BS_AUTOCHECKBOX, BS_DEFPUSHBUTTON, BS_PUSHBUTTON, CB_ADDSTRING, CB_GETCURSEL, CB_SETCURSEL,
-    CW_USEDEFAULT, ES_AUTOHSCROLL, ES_AUTOVSCROLL, ES_MULTILINE, ES_READONLY, ES_WANTRETURN,
-    WM_SETFONT, WM_SETTEXT,
+    CBS_DROPDOWNLIST, CW_USEDEFAULT, ES_AUTOHSCROLL, ES_AUTOVSCROLL, ES_MULTILINE, ES_READONLY,
+    ES_WANTRETURN, WM_SETFONT, WM_SETTEXT,
 };
 
 use crate::util;
@@ -206,6 +207,10 @@ impl Form {
     }
 
     /// Dropdown list combo (`items` pre-filled, `sel` pre-selected).
+    ///
+    /// NOTE: `CBS_DROPDOWNLIST` is mandatory. Without any CBS_* style Win32
+    /// falls back to CBS_SIMPLE (list permanently expanded) which overlays
+    /// every control placed below the combo.
     pub unsafe fn combo(
         &mut self,
         hinstance: HINSTANCE,
@@ -218,7 +223,10 @@ impl Form {
             WINDOW_EX_STYLE(0),
             w!("COMBOBOX"),
             w!(""),
-            WINDOW_STYLE(WS_CHILD.0 | WS_VISIBLE.0 | WS_TABSTOP.0 | WS_VSCROLL.0),
+            WINDOW_STYLE(
+                WS_CHILD.0 | WS_VISIBLE.0 | WS_TABSTOP.0 | WS_VSCROLL.0
+                    | CBS_DROPDOWNLIST as u32,
+            ),
             x, y, w, 160,
             Some(self.hwnd), Some(HMENU_ID(id)), Some(hinstance), None,
         ) {
@@ -298,6 +306,25 @@ pub fn HMENU_ID(id: u32) -> windows::Win32::UI::WindowsAndMessaging::HMENU {
 }
 
 // -------------------------------------------------------------- layout ----
+
+/// Convert a desired **client area** size into the outer window size for a
+/// `WS_CAPTION | WS_SYSMENU` dialog. `CreateWindowExW` takes the *outer*
+/// size; passing the client size directly crops the bottom of the form
+/// (title bar + borders eat roughly 40 px).
+pub fn outer_size_for_client(cw: i32, ch: i32) -> (i32, i32) {
+    let mut r = RECT { left: 0, top: 0, right: cw, bottom: ch };
+    unsafe {
+        let _ = AdjustWindowRectEx(
+            &mut r,
+            WINDOW_STYLE(WS_CAPTION.0 | WS_SYSMENU.0),
+            false,
+            WINDOW_EX_STYLE(0),
+        );
+    }
+    let w = r.right - r.left;
+    let h = r.bottom - r.top;
+    (w.max(cw), h.max(ch))
+}
 
 /// Center a `w x h` window rectangle on `owner`.
 pub fn center_on(owner: HWND, w: i32, h: i32) -> (i32, i32) {
@@ -379,6 +406,26 @@ pub fn pick_save(owner: HWND, title: &str, default_name: &str) -> Option<String>
         CoTaskMemFree(Some(path.0 as *const core::ffi::c_void));
         s
     }
+}
+
+// -------------------------------------------------------------- parsing --
+
+/// Parse a multi-line KEY=VALUE environment text. Blank lines and lines
+/// starting with `#` are ignored. Returns an error message on malformed lines.
+pub fn parse_env_text(s: &str) -> Result<Vec<String>, String> {
+    let mut out = Vec::new();
+    for line in s.lines() {
+        let l = line.trim();
+        if l.is_empty() || l.starts_with('#') {
+            continue;
+        }
+        let key = l.split('=').next().unwrap_or("").trim();
+        if !l.contains('=') || key.is_empty() {
+            return Err(format!("环境变量格式错误（应为 KEY=VALUE）: {l}"));
+        }
+        out.push(l.to_string());
+    }
+    Ok(out)
 }
 
 /// Set the text of an arbitrary HWND (helper for non-Form controls).
