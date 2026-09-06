@@ -1,0 +1,40 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Build and attach Windows x64 release assets
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install stable Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build release binary
+        run: cargo build --release
+
+      - name: Stage assets
+        shell: pwsh
+        run: |
+          Copy-Item target/release/rssvc.exe rssvc.exe
+          Compress-Archive -Path rssvc.exe, README.md, LICENSE, examples `
+            -DestinationPath "rssvc-${env:GITHUB_REF_NAME}-win64.zip" -Force
+
+      - name: Attach to GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            rssvc.exe
+            rssvc-*-win64.zip
+          generate_release_notes: true
