@@ -4,27 +4,29 @@ use windows::core::PCWSTR;
 use windows::Win32::System::Services::{
     ChangeServiceConfig2W, ChangeServiceConfigW, CloseServiceHandle, ControlService,
     CreateServiceW, DeleteService, OpenSCManagerW, OpenServiceW, QueryServiceStatus,
-    QueryServiceStatusEx, StartServiceW, ENUM_SERVICE_TYPE, SC_STATUS_PROCESS_INFO,
-    SERVICE_AUTO_START, SERVICE_CONFIG_DESCRIPTION, SERVICE_CONTROL_CONTINUE,
-    SERVICE_CONTROL_PARAMCHANGE, SERVICE_CONTROL_PAUSE, SERVICE_CONTROL_STOP,
-    SERVICE_DEMAND_START, SERVICE_DESCRIPTIONW, SERVICE_ERROR_NORMAL, SERVICE_NO_CHANGE,
-    SERVICE_PAUSED, SERVICE_PAUSE_PENDING, SERVICE_RUNNING, SERVICE_START_PENDING,
-    SERVICE_START_TYPE, SERVICE_STATUS, SERVICE_STATUS_PROCESS, SERVICE_STOP_PENDING,
-    SERVICE_STOPPED, SERVICE_WIN32_OWN_PROCESS,
+    QueryServiceStatusEx, StartServiceW, ENUM_SERVICE_TYPE, SC_MANAGER_ALL_ACCESS,
+    SC_MANAGER_CONNECT, SC_STATUS_PROCESS_INFO, SERVICE_ALL_ACCESS, SERVICE_AUTO_START,
+    SERVICE_CONFIG_DESCRIPTION, SERVICE_CONTROL_CONTINUE, SERVICE_CONTROL_PARAMCHANGE,
+    SERVICE_CONTROL_PAUSE, SERVICE_CONTROL_STOP, SERVICE_DEMAND_START, SERVICE_DESCRIPTIONW,
+    SERVICE_ERROR_NORMAL, SERVICE_NO_CHANGE, SERVICE_PAUSED, SERVICE_PAUSE_PENDING,
+    SERVICE_RUNNING, SERVICE_START_PENDING, SERVICE_START_TYPE, SERVICE_STATUS,
+    SERVICE_STATUS_PROCESS, SERVICE_STOPPED, SERVICE_STOP_PENDING, SERVICE_WIN32_OWN_PROCESS,
 };
 
 use crate::config::Config;
 use crate::util;
 
-pub const ACCESS_ALL: u32 = 0xF01FF; // SERVICE_ALL_ACCESS
+// Access masks are taken from the windows crate's typed constants instead
+// of hand-written magic numbers (a missing SC_MANAGER_CONNECT bit once broke
+// every query command). In windows 0.62 these constants are plain u32 aliases.
+pub const ACCESS_ALL: u32 = SERVICE_ALL_ACCESS;
 pub const ACCESS_START: u32 = 0x0010; // SERVICE_START
 pub const ACCESS_STOP: u32 = 0x0020; // SERVICE_STOP
 pub const ACCESS_PAUSE: u32 = 0x0040; // SERVICE_PAUSE_CONTINUE
 pub const ACCESS_QUERY: u32 = 0x0004; // SERVICE_QUERY_STATUS
 pub const ACCESS_CONFIG: u32 = 0x0002; // SERVICE_CHANGE_CONFIG
-pub const SC_MANAGER_WRITE: u32 = 0x0002 | 0x0004 | 0x0020;
-pub const SC_MANAGER_ALL: u32 = 0xF003F;
-pub const SC_MANAGER_CONNECT: u32 = 0x0001;
+pub const SC_MANAGER_ALL: u32 = SC_MANAGER_ALL_ACCESS;
+pub const SC_MANAGER_CONNECT_MASK: u32 = SC_MANAGER_CONNECT;
 
 // State / control constants exposed as plain u32 for the CLI layer.
 pub const CONTROL_STOP: u32 = SERVICE_CONTROL_STOP;
@@ -59,9 +61,15 @@ fn to_err(prefix: &str, e: &windows::core::Error) -> String {
     format!("{prefix}: {}{}", util::last_error(e), util::admin_hint(e))
 }
 
-/// Open the SCM database. `all = true` requests full access.
+/// Open the SCM database. `all = true` requests full access; otherwise only
+/// SC_MANAGER_CONNECT is requested — OpenServiceW requires the manager handle
+/// to carry that right even for pure queries (status / list).
 pub fn open_manager(all: bool) -> Result<windows::Win32::System::Services::SC_HANDLE, String> {
-    let access = if all { SC_MANAGER_ALL } else { SC_MANAGER_WRITE };
+    let access = if all {
+        SC_MANAGER_ALL
+    } else {
+        SC_MANAGER_CONNECT_MASK
+    };
     unsafe {
         OpenSCManagerW(PCWSTR::null(), PCWSTR::null(), access)
             .map_err(|e| to_err("打开服务控制管理器失败", &e))
@@ -91,7 +99,10 @@ pub fn create_rssvc_service(
         cfg.display_name.trim().to_string()
     };
     let display_w = wide(&display);
-    let image = format!("\"{}\" {}", util::quote_path(rssvc_exe), name);
+    // Quote the service name too: SCM parses everything after the quoted exe
+    // path as arguments, and an unquoted name containing a space would split
+    // into two arguments (making the service permanently unstartable).
+    let image = format!("{} {}", util::quote_path(rssvc_exe), util::quote_path(name));
     let image_w = wide(&image);
 
     // Dependencies: double-NUL terminated MULTI_SZ.
@@ -133,8 +144,8 @@ pub fn create_rssvc_service(
             start_type,
             SERVICE_ERROR_NORMAL,
             PCWSTR::from_raw(image_w.as_ptr()),
-            PCWSTR::null(),     // load order group
-            None,               // tag id
+            PCWSTR::null(), // load order group
+            None,           // tag id
             if has_deps {
                 PCWSTR::from_raw(deps_w.as_ptr())
             } else {
@@ -266,8 +277,13 @@ pub fn delete(svc: &Service) -> Result<(), String> {
     unsafe { DeleteService(svc.handle).map_err(|e| to_err("删除服务失败", &e)) }
 }
 
-/// Update start type / display name / description of an existing service
-/// (used by `import`).
+/// Update start type / display name / description / dependencies of an
+/// existing service (used by `import`).
+///
+/// Dependency semantics: an empty `cfg.dependencies` leaves the current
+/// dependencies untouched (passing NULL to ChangeServiceConfigW); a
+/// non-empty list replaces them. The CLI import surfaces this contract in
+/// its output so nothing is silently dropped.
 pub fn change_config(svc: &Service, cfg: &Config) -> Result<(), String> {
     let display = if cfg.display_name.trim().is_empty() {
         None
@@ -279,6 +295,21 @@ pub fn change_config(svc: &Service, cfg: &Config) -> Result<(), String> {
     } else {
         SERVICE_AUTO_START
     };
+    // Dependencies: double-NUL terminated MULTI_SZ, only when provided.
+    let mut deps_w: Vec<u16> = Vec::new();
+    for d in &cfg.dependencies {
+        let d = d.trim();
+        if !d.is_empty() {
+            deps_w.extend(d.encode_utf16());
+            deps_w.push(0);
+        }
+    }
+    deps_w.push(0);
+    let deps_ptr = if cfg.dependencies.is_empty() {
+        PCWSTR::null() // keep existing dependencies
+    } else {
+        PCWSTR::from_raw(deps_w.as_ptr())
+    };
     unsafe {
         ChangeServiceConfigW(
             svc.handle,
@@ -288,7 +319,7 @@ pub fn change_config(svc: &Service, cfg: &Config) -> Result<(), String> {
             PCWSTR::null(), // binary path
             PCWSTR::null(), // load order group
             None,           // tag id
-            PCWSTR::null(), // dependencies
+            deps_ptr,       // dependencies (null = unchanged)
             PCWSTR::null(), // start name
             PCWSTR::null(), // password
             display
@@ -313,4 +344,24 @@ pub fn change_config(svc: &Service, cfg: &Config) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    // Sanity: our re-exposed masks must equal the canonical Win32 values.
+    #[test]
+    fn access_masks_match_win32_constants() {
+        use windows::Win32::System::Services::{
+            SC_MANAGER_ALL_ACCESS, SC_MANAGER_CONNECT, SERVICE_ALL_ACCESS, SERVICE_START,
+            SERVICE_STOP,
+        };
+        assert_eq!(super::SC_MANAGER_ALL, SC_MANAGER_ALL_ACCESS);
+        assert_eq!(super::SC_MANAGER_CONNECT_MASK, SC_MANAGER_CONNECT);
+        assert_eq!(super::ACCESS_ALL, SERVICE_ALL_ACCESS);
+        assert_eq!(super::ACCESS_START, SERVICE_START);
+        assert_eq!(super::ACCESS_STOP, SERVICE_STOP);
+        // 0x0004 SERVICE_QUERY_STATUS, 0x0002 SERVICE_CHANGE_CONFIG.
+        assert_eq!(super::ACCESS_QUERY, 0x0004);
+        assert_eq!(super::ACCESS_CONFIG, 0x0002);
+    }
 }

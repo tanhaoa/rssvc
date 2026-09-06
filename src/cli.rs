@@ -14,36 +14,33 @@
 use std::io::Write;
 
 use crate::config::{self, Config};
-use crate::VERSION;
+use crate::{util, VERSION};
 
-/// Commands that cannot be a service name (used to decide dispatch).
-pub fn is_known_command(s: &str) -> bool {
-    matches!(
-        s,
-        "install"
-            | "remove"
-            | "uninstall"
-            | "start"
-            | "stop"
-            | "restart"
-            | "pause"
-            | "continue"
-            | "resume"
-            | "status"
-            | "get"
-            | "list"
-            | "export"
-            | "import"
-            | "gui"
-            | "help"
-            | "--help"
-            | "-h"
-            | "-?"
-            | "/?"
-            | "version"
-            | "--version"
-            | "-V"
-    )
+/// Read a password from the console with echo disabled. Returns None when
+/// stdin is not a console (redirected input) or reading failed.
+fn read_password(prompt: &str) -> Option<String> {
+    use windows::Win32::System::Console::{
+        GetConsoleMode, GetStdHandle, SetConsoleMode, CONSOLE_MODE, ENABLE_ECHO_INPUT,
+        STD_INPUT_HANDLE,
+    };
+    unsafe {
+        let Ok(h) = GetStdHandle(STD_INPUT_HANDLE) else {
+            return None;
+        };
+        let mut old = CONSOLE_MODE::default();
+        if GetConsoleMode(h, &mut old).is_err() {
+            return None; // not an interactive console
+        }
+        let _ = SetConsoleMode(h, CONSOLE_MODE(old.0 & !ENABLE_ECHO_INPUT.0));
+        eprint!("{prompt}");
+        let _ = std::io::stderr().flush();
+        let mut line = String::new();
+        let r = std::io::stdin().read_line(&mut line);
+        let _ = SetConsoleMode(h, old); // restore echo
+        eprintln!();
+        r.ok()
+            .map(|_| line.trim_end_matches(['\r', '\n']).to_string())
+    }
 }
 
 pub fn run(args: &[String]) -> i32 {
@@ -174,10 +171,23 @@ fn cmd_install(args: &[String]) -> i32 {
                     Some(v) => user = v,
                     None => return err_exit("--user 需要一个参数"),
                 },
-                "--password" => match val() {
-                    Some(v) => password = v,
-                    None => return err_exit("--password 需要一个参数"),
-                },
+                "--password" => {
+                    // BUG-15 style hardening: prefer interactive input; the
+                    // plaintext forms are still accepted but warn loudly.
+                    if let Some(v) = inline.clone() {
+                        eprintln!("warning: 密码以明文形式出现在命令行中 (进程列表/历史记录可见)。建议改用不带值的 --password 交互输入。");
+                        password = v;
+                    } else if i + 1 < args.len() && !args[i + 1].starts_with("--") {
+                        i += 1;
+                        eprintln!("warning: 密码以明文形式出现在命令行中 (进程列表/历史记录可见)。建议改用不带值的 --password 交互输入。");
+                        password = args[i].clone();
+                    } else {
+                        match read_password("请输入服务账户密码 (输入不回显): ") {
+                            Some(p) if !p.is_empty() => password = p,
+                            _ => return err_exit("--password 未读取到密码。"),
+                        }
+                    }
+                }
                 "--display" => match val() {
                     Some(v) => cfg.display_name = v,
                     None => return err_exit("--display 需要一个参数"),
@@ -250,13 +260,25 @@ fn cmd_install(args: &[String]) -> i32 {
         return 2;
     };
 
+    if let Err(e) = util::validate_service_name(&name) {
+        return err_exit(&e);
+    }
+
     if !std::path::Path::new(&path).is_file() {
         return err_exit(&format!("程序路径不存在: {path}"));
     }
-    cfg.application = std::fs::canonicalize(&path)
-        .map(|p| p.to_string_lossy().to_string())
-        .unwrap_or(path);
-    cfg.app_parameters = params.join(" ");
+    // canonicalize_plain strips the \\?\ verbatim prefix on Windows; raw
+    // canonicalize() output would leak it into the registry and confuse
+    // cmd.exe and programs that inspect their own path.
+    cfg.application = util::canonicalize_plain(&path);
+    // Re-quote each argument following the Windows argv rules so arguments
+    // containing spaces survive the parse -> rejoin round trip exactly as
+    // the user typed them.
+    cfg.app_parameters = params
+        .iter()
+        .map(|p| util::quote_arg(p))
+        .collect::<Vec<_>>()
+        .join(" ");
     if cfg.app_directory.trim().is_empty() {
         cfg.app_directory = std::path::Path::new(&cfg.application)
             .parent()
@@ -285,8 +307,21 @@ fn cmd_install(args: &[String]) -> i32 {
         Err(e) => return err_exit(&e),
     }
 
+    // The service now exists. If the Parameters write fails we must roll the
+    // half-created service back instead of leaving a configless shell behind.
     if let Err(e) = cfg.save_parameters(&name) {
-        return err_exit(&format!("写入注册表配置失败: {e}"));
+        let rolled = (|| -> Result<(), String> {
+            let svc = crate::scm::open_service(scm, &name, crate::scm::ACCESS_ALL)?;
+            crate::scm::delete(&svc)
+        })();
+        return err_exit(&format!(
+            "写入注册表配置失败: {e}{}",
+            if rolled.is_ok() {
+                "\n已回滚: 刚创建的服务已删除。"
+            } else {
+                "\n警告: 自动回滚失败, 请手动执行 rssvc remove "
+            }
+        ));
     }
     if let Err(e) = cfg.save_delayed_flag(&name) {
         eprintln!("warning: 设置延迟启动标志失败: {e}");
@@ -304,7 +339,9 @@ fn cmd_install(args: &[String]) -> i32 {
 // ----------------------------------------------------------------- remove --
 
 fn cmd_remove(args: &[String]) -> i32 {
-    let Some(name) = need_name(args, "remove") else { return 2 };
+    let Some(name) = need_name(args, "remove") else {
+        return 2;
+    };
     let scm = match crate::scm::open_manager(true) {
         Ok(h) => h,
         Err(e) => return err_exit(&e),
@@ -337,7 +374,9 @@ fn cmd_remove(args: &[String]) -> i32 {
 // -------------------------------------------------------- simple controls --
 
 fn simple_control(args: &[String], action: &str) -> i32 {
-    let Some(name) = need_name(args, action) else { return 2 };
+    let Some(name) = need_name(args, action) else {
+        return 2;
+    };
     let scm = match crate::scm::open_manager(true) {
         Ok(h) => h,
         Err(e) => return err_exit(&e),
@@ -433,7 +472,9 @@ fn print_status_line(name: &str, svc: &crate::scm::Service) {
 // ------------------------------------------------------------------ status --
 
 fn cmd_status(args: &[String]) -> i32 {
-    let Some(name) = need_name(args, "status") else { return 2 };
+    let Some(name) = need_name(args, "status") else {
+        return 2;
+    };
     let scm = match crate::scm::open_manager(false) {
         Ok(h) => h,
         Err(e) => return err_exit(&e),
@@ -449,7 +490,9 @@ fn cmd_status(args: &[String]) -> i32 {
 // --------------------------------------------------------------------- get --
 
 fn cmd_get(args: &[String]) -> i32 {
-    let Some(name) = need_name(args, "get") else { return 2 };
+    let Some(name) = need_name(args, "get") else {
+        return 2;
+    };
     match Config::load(&name) {
         Ok(cfg) => {
             config::print_config(&name, &cfg);
@@ -515,7 +558,9 @@ fn cmd_list() -> i32 {
 // ----------------------------------------------------------- export/import --
 
 fn cmd_export(args: &[String]) -> i32 {
-    let Some(name) = need_name(args, "export") else { return 2 };
+    let Some(name) = need_name(args, "export") else {
+        return 2;
+    };
     let cfg = match Config::load(&name) {
         Ok(c) => c,
         Err(e) => return err_exit(&format!("读取服务配置失败: {e}")),
@@ -541,7 +586,9 @@ fn cmd_export(args: &[String]) -> i32 {
 }
 
 fn cmd_import(args: &[String]) -> i32 {
-    let Some(name) = need_name(args, "import") else { return 2 };
+    let Some(name) = need_name(args, "import") else {
+        return 2;
+    };
     let Some(file) = args.get(1) else {
         eprintln!("rssvc: 用法: rssvc import <服务名> <配置.toml>");
         return 2;
@@ -557,6 +604,10 @@ fn cmd_import(args: &[String]) -> i32 {
     if cfg.application.trim().is_empty() {
         return err_exit("TOML 中缺少 application 字段");
     }
+    // Normalize the path (strip verbatim prefix, resolve relative paths when
+    // the target exists) so imported configs look the same as fresh installs.
+    let mut cfg = cfg;
+    cfg.application = util::canonicalize_plain(&cfg.application);
     if !cfg.account.trim().is_empty() && cfg.account.trim() != "LocalSystem" {
         eprintln!(
             "warning: TOML 中的 account ({}) 无法附带密码; 若创建服务失败, 请改用 install --user/--password。",
@@ -582,13 +633,30 @@ fn cmd_import(args: &[String]) -> i32 {
         }
     }
 
+    // The service may have just been created above. Roll it back if the
+    // Parameters write fails (same contract as `install`).
     if let Err(e) = cfg.save_parameters(&name) {
+        if existing.is_none() {
+            let rolled = (|| -> Result<(), String> {
+                let svc = crate::scm::open_service(scm, &name, crate::scm::ACCESS_ALL)?;
+                crate::scm::delete(&svc)
+            })();
+            let note = if rolled.is_ok() {
+                "\n已回滚: 刚创建的服务已删除。"
+            } else {
+                "\n警告: 自动回滚失败, 请手动执行 rssvc remove"
+            };
+            return err_exit(&format!("写入注册表配置失败: {e}{note}"));
+        }
         return err_exit(&format!("写入注册表配置失败: {e}"));
     }
     if let Err(e) = cfg.save_delayed_flag(&name) {
         eprintln!("warning: 设置延迟启动标志失败: {e}");
     }
-    // Start type / display name / description.
+    // Start type / display name / description / dependencies.
+    if cfg.dependencies.is_empty() {
+        eprintln!("提示: TOML 未提供 dependencies (依赖服务), 保留服务现有依赖不变。");
+    }
     let svc = match crate::scm::open_service(scm, &name, crate::scm::ACCESS_CONFIG) {
         Ok(s) => s,
         Err(e) => return err_exit(&e),
@@ -598,7 +666,10 @@ fn cmd_import(args: &[String]) -> i32 {
     }
 
     println!("服务 {name} 配置导入完成。");
-    println!("提示: 若服务正在运行, 执行 'rssvc restart {}' 或发送 PARAMCHANGE 以应用新配置。", name);
+    println!(
+        "提示: 若服务正在运行, 执行 'rssvc restart {}' 或发送 PARAMCHANGE 以应用新配置。",
+        name
+    );
     0
 }
 
@@ -640,7 +711,8 @@ install 常用选项:
   --display <名称>              服务显示名称
   --description <文本>          服务描述
   --depends <服务1,服务2>       依赖的服务
-  --user <账户> --password <密码>  以指定账户运行 (默认 LocalSystem)
+  --user <账户> [--password <密码>]  以指定账户运行 (默认 LocalSystem);
+                                --password 不带值时交互输入不回显 (推荐)
   --restart-delay <毫秒>        应用退出后重启延迟 (默认 1000)
   --throttle <毫秒>             运行时长小于该值视为异常崩溃 (默认 1500)
   --max-restarts <次数>         连续快速崩溃达到该次数后放弃 (0=不放弃, 默认 10)

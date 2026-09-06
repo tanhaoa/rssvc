@@ -4,7 +4,7 @@
 NSSM 的现代化替代品：把任意可执行文件、脚本或批处理变成原生 Windows 服务，实现开机
 自启、崩溃自动重启、日志轮转和优雅停止，而被包裹的程序完全不需要改造。
 
-单文件 exe，无运行时依赖，release 构建约 **540 KB**，还内置了一个原生 Win32
+单文件 exe，无运行时依赖，release 构建约 **560 KB**，还内置了一个原生 Win32
 **图形界面管理器**（双击 exe 即可打开），服务运行时空闲内存占用接近
 NSSM（一个进程 + 两个日志线程 + 一个监控等待，无 tokio / 无 GC / 无虚拟机）。
 
@@ -268,9 +268,19 @@ dependencies = []
 | `nssm remove <name>` | `rssvc remove <name>` |
 | `nssm list` | `rssvc list` |
 
-主要差异：rssvc 的 GUI 是一个轻量原生管理窗口（列表 + 操作，覆盖日常管理），
-复杂批量场景仍推荐 CLI/TOML；停止级别与 NSSM 的 `AppStopMethod*` 兼容
-（控制台→窗口→线程→终止，位掩码含义相同）。
+主要差异：rssvc 的 GUI 是一个原生管理窗口（列表 + 操作 + 全量配置编辑 + 实时日志
++ TOML 导入导出），复杂批量场景仍推荐 CLI/TOML；停止级别与 NSSM 的
+`AppStopMethod*` 兼容（控制台→窗口→线程→终止，位掩码含义相同）。
+
+### 与 NSSM 的已知语义差异
+
+- **空 `AppEnvironment` 的含义不同**：NSSM 中"该值存在但为空"表示用**空环境**启动
+  子进程；rssvc 中该值为空等价于"值不存在"，即**完整继承系统环境**再叠加
+  `AppEnvironmentExtra`。依赖 NSSM 空环境隔离语义的服务迁移后行为会变化。
+- **服务名不允许空白字符**：rssvc 在安装时即拒绝包含空格/制表符/引号等服务名
+  （NSSM 允许），避免 ImagePath 参数解析歧义。
+- **退出码上报采用 `SERVICE_SPECIFIC_ERROR` 规范**：rssvc 自定义码（2001/2002/2003）
+  与应用自身退出码都会出现在 `dwServiceSpecificExitCode` 字段，`sc query` 可直接读出。
 
 ## 构建
 
@@ -291,7 +301,16 @@ cargo xwin build --release --target x86_64-pc-windows-msvc
 ```
 
 `release` profile 已内置体积优化（`opt-level="s"`、LTO、单 codegen unit、
-panic=abort、strip），产物约 500 KB。
+panic=abort、strip），产物约 560 KB。
+
+### 测试与 CI
+
+- 纯逻辑单元测试覆盖：命令行参数引号规则、服务名校验、verbatim 路径剥离、
+  MULTI_SZ 解码、TOML 序列化（密码不导出）、环境块合并、日志归档名匹配、
+  SCM 掩码常量一致性等（`cargo test`）
+- GitHub Actions（`.github/workflows/`）：每次 push/PR 执行
+  `cargo fmt --check`、`cargo clippy -- -D warnings`、`cargo test`、release 构建；
+  推送 `v*` 标签时自动构建并附加 exe 与 zip 到 GitHub Release
 
 ## FAQ
 
@@ -326,6 +345,54 @@ A: 所有生命周期消息带 `[rssvc 时间戳]` 前缀写入 stdout/stderr �
 - [ ] AppExit 退出码策略（按退出码决定是否重启）
 - [ ] Windows 事件日志集成（注册消息表资源）
 - [ ] ARM64 交叉编译产物
+
+## 更新记录
+
+### v0.3.2（2026-09）— 代码审查修复版
+
+对照外部全量代码审查报告（28 项：P0×3 / P1×5 / P2×12 / P3×8）逐项修复：
+
+| 编号 | 级别 | 问题 | 状态 |
+|------|------|------|------|
+| BUG-01 | P0 | `SERVICE_NAME` 全局量从未写入，所有服务启动即以 2001 退出 | ✔ 已修复（`try_dispatch` 写入 + ServiceMain argv 兜底解析） |
+| BUG-02 | P0 | GUI 删除确认 MB_OKCANCEL 却比较 IDYES，删除永不执行 | ✔ 已修复（统一 `ask_yes_no`，MB_YESNO） |
+| BUG-03 | P0 | 编辑保存后"立即重启"询问同样错配 | ✔ 已修复（同上） |
+| BUG-04 | P1 | SCM 掩码缺 `SC_MANAGER_CONNECT`，status/list 打开服务失败 | ✔ 已修复（掩码改用 windows crate 标准常量） |
+| BUG-05 | P1 | ImagePath 服务名未加引号，含空格服务名无法启动 | ✔ 已修复（名称加引号 + 安装期拒绝空白字符） |
+| BUG-06 | P1 | CLI install 重拼参数丢失引号 | ✔ 已修复（按 Windows argv 规则逐参数重加引号） |
+| BUG-07 | P1 | `canonicalize` 引入 `\\?\` verbatim 路径写入注册表 | ✔ 已修复（`canonicalize_plain`，CLI/GUI/编辑/导入四处统一） |
+| BUG-08 | P1 | 退出码未用 SPECIFIC_ERROR 语义；读取失败兜底为 0 | ✔ 已修复（规范上报 + 失败记录告警） |
+| BUG-09 | P2 | 停止事件被手动关闭后全局量仍持有悬空句柄 | ✔ 已修复（移除手动 CloseHandle，句柄随进程回收） |
+| BUG-10 | P2 | 归档清理按前缀匹配可能误删无关文件 | ✔ 已修复（严格时间戳模式匹配 + 单元测试） |
+| BUG-11 | P2 | 轮转 rename 失败静默，日志可能无限增长 | ✔ 已修复（重试 3 次 + 失败写告警 + 保持真实 size） |
+| BUG-12 | P2 | 线程创建失败 panic 叠加 abort 使服务消失 | ✔ 已修复（降级运行：丢弃日志流/记录告警） |
+| BUG-13 | P2 | `wait_any` 遇 WAIT_FAILED 每 100ms 空转 | ✔ 已修复（返回错误走受控失败路径，新增退出码 2003） |
+| BUG-14 | P2 | install 写注册表失败不回滚遗留坏服务 | ✔ 已修复（CLI/GUI/import 三处失败自动 DeleteService） |
+| BUG-15 | P2 | `--password` 明文暴露在命令行 | ✔ 已修复（支持不回显交互输入；明文形式保留但给出警告） |
+| BUG-16 | P2 | import 更新服务时 dependencies 被静默忽略 | ✔ 已修复（非空即更新；空列表输出"保留现有依赖"提示） |
+| BUG-17 | P2 | 空 AppEnvironment 语义与 NSSM 相反 | ✔ 已文档化（README"与 NSSM 的已知语义差异"） |
+| BUG-18 | P2 | INTERROGATE 回包控制掩码与实际状态不符 | ✔ 已修复（按状态返回控制集） |
+| BUG-19 | P2 | 主窗口销毁未释放状态盒子与定时器 | ✔ 已修复（WM_DESTROY 补 KillTimer + Box 回收；投递失败自回收） |
+| BUG-20 | P2 | 停止流程提前返回不 join 读取线程 | ✔ 已修复（提前返回分支同样回收） |
+| BUG-21 | P3 | `env::vars()` 非法 UTF-8 panic | ✔ 已修复（改用 `vars_os` + 损失性转换） |
+| BUG-22 | P3 | 附加子进程控制台后不恢复原状态 | ✔ 已修复（检测原有控制台并尽力恢复） |
+| BUG-23 | P3 | 进程树快照 PID 复用竞态 | ◔ 记录为已知限制（触发窗口极小，修复成本高） |
+| BUG-24 | P3 | 已知命令名与服务名冲突 | ✔ 已修复（单参数一律先尝试 SCM 分发，名为 gui/start 的服务可正常启动） |
+| BUG-25 | P3 | 配置打印逻辑双份维护 | ◔ 暂保留（CLI 与 GUI 展示格式需求不同，属重构范畴） |
+| BUG-26 | P3 | 日志窗口 WM_SIZE 无宽度下限 | ✔ 已修复（宽高双重下限保护） |
+| BUG-27 | P3 | 无测试、无 CI、无静态检查门禁 | ✔ 已补齐（单元测试 + GitHub Actions fmt/clippy/test + 标签发布流水线） |
+| BUG-28 | P3 | 手写权限常量 / GUI 刷新开销 / 编辑项不全 | ✔ 常量改用 windows crate 标准常量；✔ 编辑对话框补齐依赖服务与停止级别编辑；◔ 列表刷新逐服务开句柄暂保留 |
+
+### v0.3.1（2026-09）— GUI 实测问题修复
+
+- 下拉框补 `CBS_DROPDOWNLIST`（修复 CBS_SIMPLE 常驻展开遮挡控件导致的界面错乱）
+- 对话框统一按客户区尺寸反推外框（修复底部按钮被标题栏/边框裁剪）
+- 详情面板与配置读取补全 NSSM 兼容键（AppEnvironmentExtra、停止策略、依赖等）
+- 安装对话框新增环境变量输入；编辑对话框双环境变量框
+
+### v0.3.0（2026-09）— GUI 短板补全
+
+- 编辑配置对话框、实时日志尾随窗口、TOML 导入导出按钮
 
 ## License
 

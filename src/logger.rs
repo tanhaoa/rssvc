@@ -18,6 +18,7 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::thread::JoinHandle;
+use std::time::Duration;
 
 use crate::util;
 
@@ -33,13 +34,16 @@ pub struct Writer {
 }
 
 impl Writer {
-    fn spawn(path: PathBuf, rotate_bytes: u32, rotate_keep: u32) -> Writer {
+    /// Spawn the writer thread. Returns `None` when thread creation fails so
+    /// the caller can degrade gracefully (discard the stream) instead of
+    /// panicking — with `panic = "abort"` a panic would take down the whole
+    /// service process just because of a transient resource shortage.
+    fn spawn(path: PathBuf, rotate_bytes: u32, rotate_keep: u32) -> Option<Writer> {
         let (tx, rx) = channel::<Msg>();
-        std::thread::Builder::new()
+        let spawned = std::thread::Builder::new()
             .name(format!("rssvc-log({})", path.display()))
-            .spawn(move || writer_loop(path, rotate_bytes, rotate_keep, rx))
-            .expect("failed to spawn log writer thread");
-        Writer { tx }
+            .spawn(move || writer_loop(path, rotate_bytes, rotate_keep, rx));
+        spawned.ok().map(|_| Writer { tx })
     }
 
     fn send(&self, b: Vec<u8>) {
@@ -76,10 +80,14 @@ impl Logger {
             let idx = match writers.iter().position(|(k, _)| *k == key) {
                 Some(i) => i,
                 None => {
-                    writers.push((
-                        key.clone(),
-                        Writer::spawn(PathBuf::from(path.trim()), rotate_bytes, rotate_keep),
-                    ));
+                    let Some(w) =
+                        Writer::spawn(PathBuf::from(path.trim()), rotate_bytes, rotate_keep)
+                    else {
+                        // Thread creation failed: drop this stream instead
+                        // of taking the service down.
+                        continue;
+                    };
+                    writers.push((key.clone(), w));
                     writers.len() - 1
                 }
             };
@@ -124,16 +132,18 @@ fn open_append(path: &Path) -> Option<File> {
             let _ = fs::create_dir_all(dir);
         }
     }
-    OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)
-        .ok()
+    OpenOptions::new().create(true).append(true).open(path).ok()
 }
 
 fn archive_name(path: &Path, stamp: &str) -> PathBuf {
-    let stem = path.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
-    let ext = path.extension().map(|s| format!(".{}", s.to_string_lossy())).unwrap_or_default();
+    let stem = path
+        .file_stem()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_default();
+    let ext = path
+        .extension()
+        .map(|s| format!(".{}", s.to_string_lossy()))
+        .unwrap_or_default();
     let mut candidate = path.with_file_name(format!("{stem}-{stamp}{ext}"));
     // Handle same-second collisions.
     let mut n = 1u32;
@@ -147,9 +157,43 @@ fn archive_name(path: &Path, stamp: &str) -> PathBuf {
     candidate
 }
 
+/// True for file names we ourselves generate as archives:
+/// `{stem}-{YYYYMMDD_HHMMSS}{ext}` or `{stem}-{YYYYMMDD_HHMMSS}-{n}{ext}`.
+/// Anything else is NOT ours, even when it shares the prefix and extension
+/// (e.g. `app-debug.log` next to `app.log`) — pruning must never touch it.
+fn is_archive_file(stem: &str, ext: &str, name: &str) -> bool {
+    let prefix = format!("{stem}-");
+    let Some(rest) = name.strip_prefix(&prefix) else {
+        return false;
+    };
+    let Some(rest) = rest.strip_suffix(ext) else {
+        return false;
+    };
+    let b = rest.as_bytes();
+    // Timestamp part: 8 digits + '_' + 6 digits.
+    if b.len() < 15 {
+        return false;
+    }
+    let digits = |s: &[u8]| s.iter().all(|c| c.is_ascii_digit());
+    if !(digits(&b[0..8]) && b[8] == b'_' && digits(&b[9..15])) {
+        return false;
+    }
+    if b.len() == 15 {
+        return true;
+    }
+    // Optional same-second collision suffix: '-<digits>'.
+    b[15] == b'-' && b.len() > 16 && digits(&b[16..])
+}
+
 fn prune_archives(base: &Path, keep: usize) {
-    let stem = base.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
-    let ext = base.extension().map(|s| format!(".{}", s.to_string_lossy())).unwrap_or_default();
+    let stem = base
+        .file_stem()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_default();
+    let ext = base
+        .extension()
+        .map(|s| format!(".{}", s.to_string_lossy()))
+        .unwrap_or_default();
     let dir = match base.parent() {
         Some(d) if !d.as_os_str().is_empty() => d.to_path_buf(),
         _ => return,
@@ -161,8 +205,13 @@ fn prune_archives(base: &Path, keep: usize) {
             if !p.is_file() {
                 continue;
             }
-            let name = p.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
-            if name.starts_with(&format!("{stem}-")) && name.ends_with(&ext) {
+            let name = p
+                .file_name()
+                .map(|s| s.to_string_lossy().to_string())
+                .unwrap_or_default();
+            // Strict match on our own archive naming pattern so unrelated
+            // files (app-debug.log, app-old.log, ...) are never deleted.
+            if is_archive_file(&stem, &ext, &name) {
                 archives.push(p);
             }
         }
@@ -184,11 +233,8 @@ fn writer_loop(path: PathBuf, mut rotate_bytes: u32, mut rotate_keep: u32, rx: R
         .map(|m| m.len())
         .unwrap_or(0);
 
-    loop {
-        let msg = match rx.recv() {
-            Ok(m) => m,
-            Err(_) => break, // all senders dropped
-        };
+    // Exits when all senders are dropped (recv errors).
+    while let Ok(msg) = rx.recv() {
         match msg {
             Msg::Cfg {
                 rotate_bytes: rb,
@@ -216,11 +262,51 @@ fn writer_loop(path: PathBuf, mut rotate_bytes: u32, mut rotate_keep: u32, rx: R
                     // Close before renaming (Windows refuses to rename open files).
                     drop(std::mem::take(&mut file));
                     let target = archive_name(&path, &util::datetime_code(&now));
-                    let _ = fs::rename(&path, &target);
+                    // External readers (editors / viewers / antivirus) can hold
+                    // the file open and make rename fail; retry briefly before
+                    // giving up.
+                    let mut renamed = false;
+                    let mut last_err = None;
+                    for attempt in 0..3 {
+                        match fs::rename(&path, &target) {
+                            Ok(()) => {
+                                renamed = true;
+                                break;
+                            }
+                            Err(e) => {
+                                last_err = Some(e);
+                                if attempt < 2 {
+                                    std::thread::sleep(Duration::from_millis(250));
+                                }
+                            }
+                        }
+                    }
                     file = open_append(&path);
                     opened_at = now;
-                    size = 0;
-                    if rotate_keep > 0 {
+                    if renamed {
+                        size = 0;
+                    } else {
+                        // Rotation failed. Keep the REAL size so the size
+                        // trigger keeps firing (retry on every write) instead
+                        // of silently disabling rotation and letting the file
+                        // grow unbounded, and record a warning inside the log
+                        // itself — the writer thread has no other channel.
+                        size = file
+                            .as_ref()
+                            .and_then(|f| f.metadata().ok())
+                            .map(|m| m.len())
+                            .unwrap_or(0);
+                        if let Some(f) = file.as_mut() {
+                            let warn = format!(
+                                "[rssvc] warning: 日志轮转失败 (目标: {}): {}\r\n",
+                                target.display(),
+                                last_err.map(|e| e.to_string()).unwrap_or_default()
+                            );
+                            let _ = f.write_all(warn.as_bytes());
+                            let _ = f.flush();
+                        }
+                    }
+                    if renamed && rotate_keep > 0 {
                         prune_archives(&path, rotate_keep as usize);
                     }
                 }
@@ -236,11 +322,12 @@ fn writer_loop(path: PathBuf, mut rotate_bytes: u32, mut rotate_keep: u32, rx: R
 }
 
 /// Spawn a reader thread that drains the read end of a pipe and forwards
-/// bytes to `writer`.
+/// bytes to `writer`. Returns `None` when thread creation fails (caller
+/// closes the read handle and logs; the service keeps running).
 pub fn spawn_pipe_reader(
     read_handle: crate::util::SharedHandle,
     writer: Writer,
-) -> JoinHandle<()> {
+) -> Option<JoinHandle<()>> {
     use std::os::windows::io::FromRawHandle;
     // Convert the raw HANDLE into a std::fs::File OUTSIDE the closure:
     // File is Send, so it can move into the reader thread, whereas a raw
@@ -257,5 +344,34 @@ pub fn spawn_pipe_reader(
                 }
             }
         })
-        .expect("failed to spawn pipe reader thread")
+        .ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn archive_pattern_matches_only_our_names() {
+        let stem = "app";
+        let ext = ".log";
+        // Our generated names.
+        assert!(is_archive_file(stem, ext, "app-20260906_153045.log"));
+        assert!(is_archive_file(stem, ext, "app-20260906_153045-1.log"));
+        assert!(is_archive_file(stem, ext, "app-20260906_153045-42.log"));
+        // Same prefix/extension but NOT ours: must never be pruned.
+        assert!(!is_archive_file(stem, ext, "app-debug.log"));
+        assert!(!is_archive_file(stem, ext, "app-old.log"));
+        assert!(!is_archive_file(stem, ext, "app-2026.log"));
+        assert!(!is_archive_file(stem, ext, "app-20260906.log"));
+        assert!(!is_archive_file(stem, ext, "app-2026_99_9999.log"));
+        assert!(!is_archive_file(stem, ext, "app-20260906_153045x.log"));
+        assert!(!is_archive_file(stem, ext, "app-20260906_153045-.log"));
+        assert!(!is_archive_file(stem, ext, "app.log"));
+        assert!(!is_archive_file(stem, ext, "other-20260906_153045.log"));
+        assert!(!is_archive_file(stem, ext, "app-20260906_153045.txt"));
+        // Empty / tricky extensions.
+        assert!(is_archive_file("svc", "", "svc-20260906_153045"));
+        assert!(!is_archive_file("svc", "", "svc-20260906_15304"));
+    }
 }

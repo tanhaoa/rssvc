@@ -17,11 +17,10 @@ use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Services::CloseServiceHandle;
 use windows::Win32::UI::Input::KeyboardAndMouse::EnableWindow;
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DestroyWindow, DefWindowProcW, GetWindowLongPtrW, LoadCursorW,
-    PostMessageW, RegisterClassExW, SetForegroundWindow, SetWindowLongPtrW,
-    ShowWindow, GWLP_USERDATA, IDC_ARROW, MB_ICONERROR, MB_ICONINFORMATION, MB_OK, SW_SHOW,
-    WM_CLOSE, WM_COMMAND, WM_DESTROY, WINDOW_EX_STYLE, WINDOW_STYLE, WNDCLASSEXW, WS_CAPTION,
-    WS_SYSMENU,
+    CreateWindowExW, DefWindowProcW, DestroyWindow, GetWindowLongPtrW, LoadCursorW, PostMessageW,
+    RegisterClassExW, SetForegroundWindow, SetWindowLongPtrW, ShowWindow, GWLP_USERDATA, IDC_ARROW,
+    MB_ICONERROR, MB_ICONINFORMATION, MB_OK, SW_SHOW, WINDOW_EX_STYLE, WINDOW_STYLE, WM_CLOSE,
+    WM_COMMAND, WM_DESTROY, WNDCLASSEXW, WS_CAPTION, WS_SYSMENU,
 };
 
 use crate::config::{
@@ -30,6 +29,7 @@ use crate::config::{
 };
 use crate::ctl::{self, Form, PickMode};
 use crate::gui::{msg_box, WM_APP_REBUILD};
+use crate::util;
 
 // Control IDs (passed as HMENU).
 const ID_NAME: u32 = 1;
@@ -70,7 +70,9 @@ struct PromptState {
 /// Open the install dialog (modeless; disables `owner` until closed).
 pub fn open_install_dialog(owner: HWND) {
     unsafe {
-        let Ok(hmodule) = GetModuleHandleW(PCWSTR::null()) else { return };
+        let Ok(hmodule) = GetModuleHandleW(PCWSTR::null()) else {
+            return;
+        };
         let hinstance = HINSTANCE(hmodule.0);
         register_class(hinstance);
 
@@ -111,7 +113,9 @@ pub fn open_install_dialog(owner: HWND) {
 /// Ask for a service name, then install `cfg` under it (TOML import flow).
 pub fn prompt_name_and_install(owner: HWND, cfg: Config) {
     unsafe {
-        let Ok(hmodule) = GetModuleHandleW(PCWSTR::null()) else { return };
+        let Ok(hmodule) = GetModuleHandleW(PCWSTR::null()) else {
+            return;
+        };
         let hinstance = HINSTANCE(hmodule.0);
         register_prompt_class(hinstance);
 
@@ -159,13 +163,15 @@ pub fn prompt_name_and_install(owner: HWND, cfg: Config) {
 fn register_class(hinstance: HINSTANCE) {
     static REGISTERED: std::sync::Once = std::sync::Once::new();
     REGISTERED.call_once(|| unsafe {
-        let mut wc = WNDCLASSEXW::default();
-        wc.cbSize = std::mem::size_of::<WNDCLASSEXW>() as u32;
-        wc.lpfnWndProc = Some(dlg_wndproc);
-        wc.hInstance = hinstance;
-        wc.hCursor = LoadCursorW(None, IDC_ARROW).unwrap_or_default();
-        wc.hbrBackground = color_window_brush();
-        wc.lpszClassName = w!("rssvcInstallWnd");
+        let wc = WNDCLASSEXW {
+            cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
+            lpfnWndProc: Some(dlg_wndproc),
+            hInstance: hinstance,
+            hCursor: LoadCursorW(None, IDC_ARROW).unwrap_or_default(),
+            hbrBackground: color_window_brush(),
+            lpszClassName: w!("rssvcInstallWnd"),
+            ..Default::default()
+        };
         RegisterClassExW(&wc);
     });
 }
@@ -173,13 +179,15 @@ fn register_class(hinstance: HINSTANCE) {
 fn register_prompt_class(hinstance: HINSTANCE) {
     static REGISTERED: std::sync::Once = std::sync::Once::new();
     REGISTERED.call_once(|| unsafe {
-        let mut wc = WNDCLASSEXW::default();
-        wc.cbSize = std::mem::size_of::<WNDCLASSEXW>() as u32;
-        wc.lpfnWndProc = Some(prompt_wndproc);
-        wc.hInstance = hinstance;
-        wc.hCursor = LoadCursorW(None, IDC_ARROW).unwrap_or_default();
-        wc.hbrBackground = color_window_brush();
-        wc.lpszClassName = w!("rssvcPromptWnd");
+        let wc = WNDCLASSEXW {
+            cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
+            lpfnWndProc: Some(prompt_wndproc),
+            hInstance: hinstance,
+            hCursor: LoadCursorW(None, IDC_ARROW).unwrap_or_default(),
+            hbrBackground: color_window_brush(),
+            lpszClassName: w!("rssvcPromptWnd"),
+            ..Default::default()
+        };
         RegisterClassExW(&wc);
     });
 }
@@ -200,7 +208,12 @@ unsafe fn create_form(st: &mut DlgState, hinstance: HINSTANCE) {
         ("显示名称 (可选)", ID_DISPLAY, None, 66),
         ("应用程序 *", ID_APP, Some(ID_BROWSE_APP), 120),
         ("启动参数 (可选)", ID_ARGS, None, 174),
-        ("工作目录 (可选, 默认: 程序所在目录)", ID_DIR, Some(ID_BROWSE_DIR), 228),
+        (
+            "工作目录 (可选, 默认: 程序所在目录)",
+            ID_DIR,
+            Some(ID_BROWSE_DIR),
+            228,
+        ),
     ];
     for (text, id, browse, y) in rows {
         f.label(hinstance, text, 14, y, 400);
@@ -219,7 +232,15 @@ unsafe fn create_form(st: &mut DlgState, hinstance: HINSTANCE) {
     f.edit(hinstance, ID_STDERR, 344, 300, 286);
     // Combos.
     f.label(hinstance, "启动类型", 14, 338, 64);
-    f.combo(hinstance, ID_STARTUP, 82, 334, 170, &["自动", "自动（延迟启动）", "手动"], 0);
+    f.combo(
+        hinstance,
+        ID_STARTUP,
+        82,
+        334,
+        170,
+        &["自动", "自动（延迟启动）", "手动"],
+        0,
+    );
     f.label(hinstance, "进程优先级", 300, 338, 76);
     f.combo(
         hinstance,
@@ -235,12 +256,32 @@ unsafe fn create_form(st: &mut DlgState, hinstance: HINSTANCE) {
     f.label(
         hinstance,
         "环境变量 (可选; 每行一个 KEY=VALUE, # 开头行忽略; 追加在系统环境之上)",
-        14, 376, 600,
+        14,
+        376,
+        600,
     );
     f.edit_ml(hinstance, ID_ENV, 14, 394, DLG_W - 28, 92, false);
     // Buttons.
-    f.button(hinstance, ID_OK, "安装", DLG_W - 14 - 224, 498, 104, 30, true);
-    f.button(hinstance, ID_CANCEL, "取消", DLG_W - 14 - 104, 498, 104, 30, false);
+    f.button(
+        hinstance,
+        ID_OK,
+        "安装",
+        DLG_W - 14 - 224,
+        498,
+        104,
+        30,
+        true,
+    );
+    f.button(
+        hinstance,
+        ID_CANCEL,
+        "取消",
+        DLG_W - 14 - 104,
+        498,
+        104,
+        30,
+        false,
+    );
 }
 
 // ---------------------------------------------------------------- wndproc ----
@@ -265,7 +306,8 @@ unsafe extern "system" fn dlg_wndproc(
                     let _ = DestroyWindow(hwnd);
                 }
                 ID_BROWSE_APP => {
-                    if let Some(path) = pick(st.owner, "选择应用程序可执行文件", PickMode::Exe) {
+                    if let Some(path) = pick(st.owner, "选择应用程序可执行文件", PickMode::Exe)
+                    {
                         st.form.set_text(ID_APP, &path);
                     }
                 }
@@ -341,31 +383,51 @@ fn pick(owner: HWND, title: &str, mode: PickMode) -> Option<String> {
 
 /// Create the service (`name`) for `cfg`, shared by GUI install / TOML import.
 /// Mirrors the CLI `install` behavior: CreateServiceW + Parameters registry.
+/// On a Parameters failure the freshly created service is rolled back so no
+/// configless shell is left behind.
 pub fn install_service(name: &str, cfg: &Config) -> Result<(), String> {
     let Ok(self_exe) = std::env::current_exe() else {
         return Err("无法确定 rssvc.exe 自身路径。".to_string());
     };
     let scm = crate::scm::open_manager(true)?;
-    let res = crate::scm::create_rssvc_service(scm, name, cfg, &self_exe.to_string_lossy());
+    let created = crate::scm::create_rssvc_service(scm, name, cfg, &self_exe.to_string_lossy());
+    let created = match created {
+        Ok(svc) => svc,
+        Err(e) => {
+            unsafe {
+                let _ = CloseServiceHandle(scm);
+            }
+            return Err(e);
+        }
+    };
+    if let Err(e) = cfg.save_parameters(name) {
+        // Roll back the half-created service.
+        let rolled = crate::scm::delete(&created);
+        unsafe {
+            let _ = CloseServiceHandle(scm);
+        }
+        return Err(format!(
+            "写入注册表配置失败: {e}{}",
+            if rolled.is_ok() {
+                "\n已回滚: 刚创建的服务已删除。"
+            } else {
+                "\n警告: 自动回滚失败, 请手动删除该服务。"
+            }
+        ));
+    }
+    drop(created);
+    let _ = cfg.save_delayed_flag(name); // best-effort
     unsafe {
         let _ = CloseServiceHandle(scm);
     }
-    res?;
-    cfg.save_parameters(name)
-        .map_err(|e| format!("服务已创建，但写入注册表配置失败: {e}"))?;
-    let _ = cfg.save_delayed_flag(name); // best-effort
     Ok(())
 }
 
 fn valid_name(name: &str) -> Option<String> {
-    const BAD_CHARS: &str = "\\/:*?\"<>|";
     if name.is_empty() {
         return Some("请填写服务名。".to_string());
     }
-    if name.chars().any(|c| BAD_CHARS.contains(c)) {
-        return Some("服务名不能包含 \\ / : * ? \" < > | 等字符。".to_string());
-    }
-    None
+    util::validate_service_name(name).err()
 }
 
 fn on_ok(st: &mut DlgState) {
@@ -377,14 +439,20 @@ fn on_ok(st: &mut DlgState) {
         return;
     }
     if app.is_empty() || !std::path::Path::new(&app).is_file() {
-        msg_box(st.form.hwnd, "应用程序路径无效或文件不存在。", "rssvc", MB_OK | MB_ICONERROR);
+        msg_box(
+            st.form.hwnd,
+            "应用程序路径无效或文件不存在。",
+            "rssvc",
+            MB_OK | MB_ICONERROR,
+        );
         return;
     }
 
-    let mut cfg = Config::default();
-    cfg.application = std::fs::canonicalize(&app)
-        .map(|p| p.to_string_lossy().to_string())
-        .unwrap_or_else(|_| app.clone());
+    let mut cfg = Config {
+        // canonicalize_plain keeps verbatim (\\?\) prefixes out of the registry.
+        application: util::canonicalize_plain(&app),
+        ..Default::default()
+    };
     cfg.app_parameters = st.form.text(ID_ARGS);
     let dir = st.form.text(ID_DIR);
     cfg.app_directory = if dir.is_empty() {
@@ -410,7 +478,11 @@ fn on_ok(st: &mut DlgState) {
         PRIORITY_IDLE,
     ][pr.min(5)];
     let display = st.form.text(ID_DISPLAY);
-    cfg.display_name = if display.is_empty() { name.clone() } else { display };
+    cfg.display_name = if display.is_empty() {
+        name.clone()
+    } else {
+        display
+    };
     // Environment: AppEnvironmentExtra (NSSM's recommended location); the
     // shared runner also merges it on top of AppEnvironment at spawn time.
     match ctl::parse_env_text(&st.form.text(ID_ENV)) {

@@ -7,17 +7,16 @@ use std::time::Duration;
 
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::{
-    CloseHandle, ERROR_CALL_NOT_IMPLEMENTED, ERROR_FAILED_SERVICE_CONTROLLER_CONNECT, HANDLE,
+    ERROR_CALL_NOT_IMPLEMENTED, ERROR_FAILED_SERVICE_CONTROLLER_CONNECT, HANDLE,
 };
 use windows::Win32::System::Services::{
     RegisterServiceCtrlHandlerExW, SetServiceStatus, StartServiceCtrlDispatcherW,
-    SERVICE_ACCEPT_PAUSE_CONTINUE, SERVICE_ACCEPT_PARAMCHANGE, SERVICE_ACCEPT_SHUTDOWN,
+    SERVICE_ACCEPT_PARAMCHANGE, SERVICE_ACCEPT_PAUSE_CONTINUE, SERVICE_ACCEPT_SHUTDOWN,
     SERVICE_ACCEPT_STOP, SERVICE_CONTROL_CONTINUE, SERVICE_CONTROL_INTERROGATE,
     SERVICE_CONTROL_PARAMCHANGE, SERVICE_CONTROL_PAUSE, SERVICE_CONTROL_SHUTDOWN,
     SERVICE_CONTROL_STOP, SERVICE_PAUSED, SERVICE_PAUSE_PENDING, SERVICE_RUNNING,
-    SERVICE_START_PENDING, SERVICE_STATUS, SERVICE_STATUS_CURRENT_STATE,
-    SERVICE_STATUS_HANDLE, SERVICE_STOP_PENDING, SERVICE_STOPPED, SERVICE_TABLE_ENTRYW,
-    SERVICE_WIN32_OWN_PROCESS,
+    SERVICE_START_PENDING, SERVICE_STATUS, SERVICE_STATUS_CURRENT_STATE, SERVICE_STATUS_HANDLE,
+    SERVICE_STOPPED, SERVICE_STOP_PENDING, SERVICE_TABLE_ENTRYW, SERVICE_WIN32_OWN_PROCESS,
 };
 use windows::Win32::System::Threading::{CreateEventW, ResetEvent, SetEvent};
 
@@ -29,6 +28,14 @@ use crate::{util, VERSION};
 // Exit codes reported to the SCM.
 pub const EXIT_CONFIG_ERROR: u32 = 2001;
 pub const EXIT_SPAWN_ERROR: u32 = 2002;
+pub const EXIT_WAIT_ERROR: u32 = 2003;
+
+// Custom exit codes (and the wrapped application's own exit codes) do not
+// belong in dwWin32ExitCode, which per Win32 contract carries system error
+// codes only. They are reported as ERROR_SERVICE_SPECIFIC_ERROR +
+// dwServiceSpecificExitCode instead, so services.msc / sc query / Event
+// Viewer display them correctly.
+const ERROR_SERVICE_SPECIFIC_ERROR: u32 = 1066;
 
 static STATUS_HANDLE: OnceLock<StatusHandle> = OnceLock::new();
 static CURRENT_STATE: AtomicU32 = AtomicU32::new(SERVICE_STOPPED.0);
@@ -70,12 +77,17 @@ fn report(
 ) {
     CURRENT_STATE.store(state.0, Ordering::SeqCst);
     let Some(h) = STATUS_HANDLE.get() else { return };
+    let (win32, specific) = if exit_code == 0 {
+        (0, 0)
+    } else {
+        (ERROR_SERVICE_SPECIFIC_ERROR, exit_code)
+    };
     let ss = SERVICE_STATUS {
         dwServiceType: SERVICE_WIN32_OWN_PROCESS,
         dwCurrentState: state,
         dwControlsAccepted: controls,
-        dwWin32ExitCode: exit_code,
-        dwServiceSpecificExitCode: 0,
+        dwWin32ExitCode: win32,
+        dwServiceSpecificExitCode: specific,
         dwCheckPoint: checkpoint,
         dwWaitHint: wait_hint_ms,
     };
@@ -89,6 +101,19 @@ fn controls_running() -> u32 {
         | SERVICE_ACCEPT_SHUTDOWN
         | SERVICE_ACCEPT_PAUSE_CONTINUE
         | SERVICE_ACCEPT_PARAMCHANGE
+}
+
+/// Controls accepted for a given state, so INTERROGATE replies always match
+/// what the service would report proactively in that state (paused services
+/// do not accept PARAMCHANGE; pending states accept nothing).
+fn controls_for_state(state: SERVICE_STATUS_CURRENT_STATE) -> u32 {
+    match state {
+        SERVICE_RUNNING => controls_running(),
+        SERVICE_PAUSED => {
+            SERVICE_ACCEPT_STOP | SERVICE_ACCEPT_SHUTDOWN | SERVICE_ACCEPT_PAUSE_CONTINUE
+        }
+        _ => 0,
+    }
 }
 
 unsafe extern "system" fn control_handler(
@@ -121,7 +146,13 @@ unsafe extern "system" fn control_handler(
         }
         SERVICE_CONTROL_INTERROGATE => {
             let state = CURRENT_STATE.load(Ordering::SeqCst);
-            report(SERVICE_STATUS_CURRENT_STATE(state), controls_running(), 0, 0, 0);
+            report(
+                SERVICE_STATUS_CURRENT_STATE(state),
+                controls_for_state(SERVICE_STATUS_CURRENT_STATE(state)),
+                0,
+                0,
+                0,
+            );
             0
         }
         _ => ERROR_CALL_NOT_IMPLEMENTED.0,
@@ -131,6 +162,12 @@ unsafe extern "system" fn control_handler(
 /// Try to run as a Windows service. Returns false if we are not running
 /// under the SCM (console context), so the caller can fall back to CLI mode.
 pub fn try_dispatch(name: String) -> bool {
+    // Record the service identity for service_main. Without this the worker
+    // would read an empty name and fail to load its registry configuration
+    // (every installed service would exit immediately with code 2001).
+    // SCM guarantees argv[0] carries the same name; service_main falls back
+    // to parsing argv if this OnceLock was somehow not set.
+    let _ = crate::SERVICE_NAME.set(name.clone());
     let name_w = util::to_wide(&name);
     let table = [
         SERVICE_TABLE_ENTRYW {
@@ -152,11 +189,13 @@ pub fn try_dispatch(name: String) -> bool {
     }
 }
 
-unsafe extern "system" fn service_main(_argc: u32, _argv: *mut windows::core::PWSTR) {
-    let name = crate::SERVICE_NAME
-        .get()
-        .cloned()
-        .unwrap_or_default();
+unsafe extern "system" fn service_main(argc: u32, argv: *mut windows::core::PWSTR) {
+    let mut name = crate::SERVICE_NAME.get().cloned().unwrap_or_default();
+    if name.is_empty() && argc > 0 && !argv.is_null() {
+        // Fallback: SCM passes the service name as argv[0].
+        let first = *argv;
+        name = util::pwstr_to_string(first.0);
+    }
     let code = run_service(&name);
     // Ensure the process exits with the service exit code.
     std::process::exit(code as i32);
@@ -186,7 +225,10 @@ fn run_service(name: &str) -> u32 {
         Ok(h) if !h.is_invalid() => h,
         Ok(_) => return EXIT_CONFIG_ERROR,
         Err(e) => {
-            eprintln!("rssvc: RegisterServiceCtrlHandlerExW 失败: {}", util::last_error(&e));
+            eprintln!(
+                "rssvc: RegisterServiceCtrlHandlerExW 失败: {}",
+                util::last_error(&e)
+            );
             return EXIT_CONFIG_ERROR;
         }
     };
@@ -206,12 +248,7 @@ fn worker(name: &str) -> u32 {
         Err(_) => return EXIT_CONFIG_ERROR,
     };
 
-    let logger = Logger::new(
-        &cfg.stdout,
-        &cfg.stderr,
-        cfg.rotate_bytes,
-        cfg.rotate_keep,
-    );
+    let logger = Logger::new(&cfg.stdout, &cfg.stderr, cfg.rotate_bytes, cfg.rotate_keep);
     logger.service_line(&format!(
         "rssvc v{VERSION}: starting service '{name}' (\"{}\" {})",
         cfg.application, cfg.app_parameters
@@ -238,14 +275,29 @@ fn worker(name: &str) -> u32 {
             "application started (pid {}, ran \"{}\" {})",
             child.pid, cfg.application, cfg.app_parameters
         ));
-        report(SERVICE_RUNNING, controls_running(), 0, 0, 0);
+        report(
+            SERVICE_RUNNING,
+            controls_for_state(SERVICE_RUNNING),
+            0,
+            0,
+            0,
+        );
 
         'inner: loop {
             let handles = [child.process, stop_ev, pause_ev, reload_ev];
-            match runner::wait_any(&handles) {
+            let Some(idx) = runner::wait_any(&handles) else {
+                // WaitForMultipleObjects failed (e.g. an invalid handle).
+                // Fail in a controlled way instead of spinning forever.
+                logger.service_line("error: WaitForMultipleObjects 失败, 服务将停止");
+                return EXIT_WAIT_ERROR;
+            };
+            match idx {
                 0 => {
                     // Application exited on its own.
-                    let code = runner::exit_code(child.process);
+                    let code = runner::exit_code(child.process).unwrap_or_else(|| {
+                        logger.service_line("warning: 读取应用退出码失败 (GetExitCodeProcess)");
+                        0
+                    });
                     let ran = child.start.elapsed();
                     // Closing the job handle (in Child::drop) kills any leftover
                     // processes in the tree, which in turn closes the pipe write
@@ -309,17 +361,16 @@ fn worker(name: &str) -> u32 {
                     report(SERVICE_PAUSE_PENDING, 0, 0, 1, hint);
                     runner::stop_child(&mut child, &cfg, &logger, false);
                     logger.service_line("service paused (application stopped)");
-                    report(
-                        SERVICE_PAUSED,
-                        SERVICE_ACCEPT_STOP | SERVICE_ACCEPT_SHUTDOWN | SERVICE_ACCEPT_PAUSE_CONTINUE,
-                        0,
-                        0,
-                        0,
-                    );
+                    report(SERVICE_PAUSED, controls_for_state(SERVICE_PAUSED), 0, 0, 0);
                     // Wait for RESUME or STOP.
                     let wait_handles = [stop_ev, resume_ev];
-                    if runner::wait_any(&wait_handles) == 0 {
-                        break 'outer;
+                    match runner::wait_any(&wait_handles) {
+                        Some(0) => break 'outer,
+                        Some(_) => {}
+                        None => {
+                            logger.service_line("error: 等待恢复/停止事件失败, 服务将停止");
+                            break 'outer;
+                        }
                     }
                     unsignal(&RESUME_EVENT);
                     logger.service_line("service resumed");
@@ -343,20 +394,17 @@ fn worker(name: &str) -> u32 {
         }
     }
 
-    // Stop event no longer needed.
-    if let Some(h) = STOP_EVENT.get() {
-        unsafe {
-            let _ = CloseHandle(h.0);
-        }
-    }
+    // NOTE: do not CloseHandle the STOP/PAUSE/RESUME/RELOAD events here.
+    // The control handler can still fire after the worker returns (SCM is
+    // asynchronous), and closing the handle leaves a stale value in the
+    // OnceLock that SetEvent could then apply to an unrelated object whose
+    // handle value got recycled. The kernel reclaims event handles when the
+    // process exits right after this function returns.
     0
 }
 
 fn stop_hint(cfg: &Config) -> u32 {
-    cfg.stop_timeout_console
-        + cfg.stop_timeout_window
-        + cfg.stop_timeout_threads
-        + 5000
+    cfg.stop_timeout_console + cfg.stop_timeout_window + cfg.stop_timeout_threads + 5000
 }
 
 /// true when a stop has been requested (manual-reset stop event signaled).

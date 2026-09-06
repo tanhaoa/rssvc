@@ -168,8 +168,13 @@ fn parameters_key_path(name: &str) -> String {
 
 /// Write a REG_MULTI_SZ, or delete the value when the list is empty.
 ///
-/// NSSM treats an *empty* `AppEnvironment` as "clear the whole environment",
-/// so an empty list must delete the value rather than write an empty array.
+/// SEMANTIC NOTE (differs from NSSM, kept intentionally): NSSM treats an
+/// *empty* `AppEnvironment` value as "start the child with an EMPTY
+/// environment". rssvc instead deletes an empty list, meaning "inherit the
+/// full system environment and apply `AppEnvironmentExtra` on top". A
+/// service migrated from NSSM that relied on the empty-value isolation
+/// semantics will see more environment variables after the switch. This is
+/// documented in README ("与 NSSM 的差异"); keep both sides in sync.
 fn set_or_delete_multi(key: &RegKey, name: &str, vals: &[String]) -> std::io::Result<()> {
     if vals.is_empty() {
         let _ = key.delete_value(name); // missing value is fine
@@ -360,7 +365,10 @@ pub fn print_config(name: &str, c: &Config) {
         println!("stderr 日志:   {}", c.stderr);
     }
     println!("进程优先级:    {}", c.priority_name());
-    println!("日志轮转:      {} 字节 / 保留 {} 份", c.rotate_bytes, c.rotate_keep);
+    println!(
+        "日志轮转:      {} 字节 / 保留 {} 份",
+        c.rotate_bytes, c.rotate_keep
+    );
     println!(
         "停止策略:      跳过掩码 {} (1控制台 2窗口 4线程 8强杀)",
         c.stop_method_skip
@@ -418,10 +426,15 @@ pub fn raw_other_values(name: &str) -> Vec<(String, String)> {
     };
     let mut out = Vec::new();
     for vname in key.enum_values().flatten().map(|(n, _)| n) {
-        if MODELED_PARAMETER_KEYS.iter().any(|k| k.eq_ignore_ascii_case(&vname)) {
+        if MODELED_PARAMETER_KEYS
+            .iter()
+            .any(|k| k.eq_ignore_ascii_case(&vname))
+        {
             continue;
         }
-        let Ok(raw) = key.get_raw_value(&vname) else { continue };
+        let Ok(raw) = key.get_raw_value(&vname) else {
+            continue;
+        };
         let text = match raw.vtype {
             REG_MULTI_SZ => multi_sz_to_strings(&raw.bytes),
             REG_BINARY => raw
@@ -435,7 +448,7 @@ pub fn raw_other_values(name: &str) -> Vec<(String, String)> {
         };
         out.push((vname, text));
     }
-    out.sort_by(|a, b| a.0.to_lowercase().cmp(&b.0.to_lowercase()));
+    out.sort_by_key(|a| a.0.to_lowercase());
     out
 }
 
@@ -443,7 +456,9 @@ pub fn raw_other_values(name: &str) -> Vec<(String, String)> {
 /// display string joined by ` | `.
 fn multi_sz_to_strings(bytes: &[u8]) -> String {
     let units: Vec<u16> = bytes
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|c| u16::from_le_bytes([c[0], c[1]]))
         .collect();
     units
@@ -452,4 +467,46 @@ fn multi_sz_to_strings(bytes: &[u8]) -> String {
         .map(String::from_utf16_lossy)
         .collect::<Vec<_>>()
         .join(" | ")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn multi_sz_decode_roundtrip() {
+        // "A=1", "B=2" encoded as UTF-16LE entries with NUL separators.
+        let mut bytes: Vec<u8> = Vec::new();
+        for s in ["A=1", "B=2"] {
+            for u in s.encode_utf16() {
+                bytes.extend_from_slice(&u.to_le_bytes());
+            }
+            bytes.extend_from_slice(&[0, 0]);
+        }
+        bytes.extend_from_slice(&[0, 0]); // final terminator
+        assert_eq!(multi_sz_to_strings(&bytes), "A=1 | B=2");
+        // Degenerate inputs must not panic.
+        assert_eq!(multi_sz_to_strings(&[]), "");
+        assert_eq!(multi_sz_to_strings(&[0, 0]), "");
+        assert_eq!(multi_sz_to_strings(&[0x41, 0]), "A");
+        // Odd byte count is tolerated (truncated tail ignored).
+        assert_eq!(multi_sz_to_strings(&[0x41, 0, 0x42]), "A");
+    }
+
+    #[test]
+    fn config_toml_roundtrip_keeps_password_out() {
+        let c = Config {
+            application: r"C:\apps\server.exe".into(),
+            environment_extra: vec!["PORT=8080".into()],
+            password: "secret".into(),
+            ..Default::default()
+        };
+        let s = toml::to_string_pretty(&c).unwrap();
+        assert!(!s.contains("secret"), "password must never be exported");
+        // password is skipped (not just blank), so it deserializes as default.
+        let back: Config = toml::from_str(&s).unwrap();
+        assert!(back.password.is_empty());
+        assert_eq!(back.environment_extra, vec!["PORT=8080".to_string()]);
+        assert_eq!(back.application, r"C:\apps\server.exe");
+    }
 }

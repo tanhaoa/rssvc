@@ -2,27 +2,28 @@
 //!
 //! 从注册表加载当前配置（`Config::load`），表单预填后允许修改：
 //! 显示名称 / 描述 / 应用程序 / 启动参数 / 工作目录 / stdout / stderr /
-//! 启动类型 / 进程优先级 / 日志轮转 / 重启策略 / 停止超时 / 环境变量。
+//! 启动类型 / 进程优先级 / 日志轮转 / 重启策略 / 停止超时 / 环境变量 /
+//! 依赖服务 / 停止级别跳过。
 //!
 //! 保存流程与 CLI `import` 一致：
 //!   1. `Config::save_parameters`（Parameters 注册表键）
 //!   2. `save_delayed_flag`（延迟自动启动标志）
-//!   3. `scm::change_config`（ChangeServiceConfigW + 描述）
+//!   3. `scm::change_config`（ChangeServiceConfigW + 描述 + 依赖）
 //!   4. 尽力发送 SERVICE_CONTROL_PARAMCHANGE（轮转参数即时生效）
 //!   5. 询问是否立即重启服务（后台线程执行，结果经 WM_APP 回传主窗口）
 //!
 //! 服务名不可修改（改名等价于删除重建，为避免误操作不提供）。
+//! 运行账户修改需要交互式密码输入，暂不在表单中提供（用 CLI install）。
 
 use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Input::KeyboardAndMouse::EnableWindow;
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DestroyWindow, GetWindowLongPtrW, LoadCursorW, PostMessageW,
-    RegisterClassExW, SendMessageW, SetForegroundWindow, SetWindowLongPtrW, ShowWindow,
-    GWLP_USERDATA, IDC_ARROW, MB_ICONERROR, MB_ICONQUESTION, MB_OK, MB_OKCANCEL,
-    MB_SETFOREGROUND, MB_TOPMOST, SW_SHOW, WM_CLOSE, WM_COMMAND, WM_DESTROY, WM_SETFONT,
-    WINDOW_EX_STYLE, WINDOW_STYLE, WNDCLASSEXW, WS_CAPTION, WS_SYSMENU,
+    CreateWindowExW, DestroyWindow, GetWindowLongPtrW, LoadCursorW, PostMessageW, RegisterClassExW,
+    SendMessageW, SetForegroundWindow, SetWindowLongPtrW, ShowWindow, GWLP_USERDATA, IDC_ARROW,
+    MB_ICONERROR, MB_OK, SW_SHOW, WINDOW_EX_STYLE, WINDOW_STYLE, WM_CLOSE, WM_COMMAND, WM_DESTROY,
+    WM_SETFONT, WNDCLASSEXW, WS_CAPTION, WS_SYSMENU,
 };
 
 use crate::config::{
@@ -55,13 +56,18 @@ const ID_ENV: u32 = 18;
 const ID_ENV_EXTRA: u32 = 19;
 const ID_OK: u32 = 20;
 const ID_CANCEL: u32 = 21;
+const ID_SKIP_C: u32 = 22; // stop-method-skip checkboxes (bits of AppStopMethodSkip)
+const ID_SKIP_W: u32 = 23;
+const ID_SKIP_T: u32 = 24;
+const ID_SKIP_K: u32 = 25;
+const ID_DEPS: u32 = 26;
 const ID_BROWSE_APP: u32 = 30;
 const ID_BROWSE_DIR: u32 = 31;
 
 // Desired CLIENT area size; the outer window size is computed from it via
 // AdjustWindowRectEx (title bar + borders would otherwise crop the form).
 const DLG_W: i32 = 720;
-const DLG_H: i32 = 642;
+const DLG_H: i32 = 722;
 
 struct EditState {
     owner: HWND,
@@ -74,7 +80,9 @@ struct EditState {
 /// Open the edit dialog for service `name` with its current `cfg` preloaded.
 pub fn open_edit_dialog(owner: HWND, name: String, cfg: Config) {
     unsafe {
-        let Ok(hmodule) = GetModuleHandleW(PCWSTR::null()) else { return };
+        let Ok(hmodule) = GetModuleHandleW(PCWSTR::null()) else {
+            return;
+        };
         let hinstance = HINSTANCE(hmodule.0);
         register_class(hinstance);
 
@@ -117,9 +125,11 @@ pub fn open_edit_dialog(owner: HWND, name: String, cfg: Config) {
 fn register_class(hinstance: HINSTANCE) {
     static REGISTERED: std::sync::Once = std::sync::Once::new();
     REGISTERED.call_once(|| unsafe {
-        let mut wc = WNDCLASSEXW::default();
-        wc.cbSize = std::mem::size_of::<WNDCLASSEXW>() as u32;
-        wc.lpfnWndProc = Some(edit_wndproc);
+        let mut wc = WNDCLASSEXW {
+            cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
+            lpfnWndProc: Some(edit_wndproc),
+            ..Default::default()
+        };
         wc.hInstance = hinstance;
         wc.hCursor = LoadCursorW(None, IDC_ARROW).unwrap_or_default();
         wc.hbrBackground = windows::Win32::Graphics::Gdi::HBRUSH(
@@ -144,13 +154,26 @@ unsafe fn create_form(st: &mut EditState, hinstance: HINSTANCE) {
         WINDOW_EX_STYLE(0),
         w!("STATIC"),
         PCWSTR::from_raw(name_h.as_ptr()),
-        WINDOW_STYLE(windows::Win32::UI::WindowsAndMessaging::WS_CHILD.0
-            | windows::Win32::UI::WindowsAndMessaging::WS_VISIBLE.0),
-        14, 24, 500, 18,
-        Some(f.hwnd), None, Some(hinstance), None,
+        WINDOW_STYLE(
+            windows::Win32::UI::WindowsAndMessaging::WS_CHILD.0
+                | windows::Win32::UI::WindowsAndMessaging::WS_VISIBLE.0,
+        ),
+        14,
+        24,
+        500,
+        18,
+        Some(f.hwnd),
+        None,
+        Some(hinstance),
+        None,
     );
     if let Ok(h) = name_static {
-        SendMessageW(h, WM_SETFONT, Some(WPARAM(f.hfont.0 as usize)), Some(LPARAM(1)));
+        SendMessageW(
+            h,
+            WM_SETFONT,
+            Some(WPARAM(f.hfont.0 as usize)),
+            Some(LPARAM(1)),
+        );
     }
 
     f.label(hinstance, "显示名称 (可选，留空保持不变)", 14, 50, 400);
@@ -161,14 +184,38 @@ unsafe fn create_form(st: &mut EditState, hinstance: HINSTANCE) {
 
     f.label(hinstance, "应用程序 *", 14, 142, 400);
     f.edit(hinstance, ID_APP, 14, 158, full_w - 118);
-    f.button(hinstance, ID_BROWSE_APP, "浏览...", right_edge - 104, 157, 104, 26, false);
+    f.button(
+        hinstance,
+        ID_BROWSE_APP,
+        "浏览...",
+        right_edge - 104,
+        157,
+        104,
+        26,
+        false,
+    );
 
     f.label(hinstance, "启动参数 (可选)", 14, 192, 400);
     f.edit(hinstance, ID_ARGS, 14, 208, full_w);
 
-    f.label(hinstance, "工作目录 (可选, 默认: 程序所在目录)", 14, 238, 400);
+    f.label(
+        hinstance,
+        "工作目录 (可选, 默认: 程序所在目录)",
+        14,
+        238,
+        400,
+    );
     f.edit(hinstance, ID_DIR, 14, 254, full_w - 118);
-    f.button(hinstance, ID_BROWSE_DIR, "浏览...", right_edge - 104, 253, 104, 26, false);
+    f.button(
+        hinstance,
+        ID_BROWSE_DIR,
+        "浏览...",
+        right_edge - 104,
+        253,
+        104,
+        26,
+        false,
+    );
 
     f.label(hinstance, "stdout 日志 (可选)", 14, 288, 280);
     f.label(hinstance, "stderr 日志 (可选)", 14 + half_w + 20, 288, 280);
@@ -176,7 +223,15 @@ unsafe fn create_form(st: &mut EditState, hinstance: HINSTANCE) {
     f.edit(hinstance, ID_STDERR, 14 + half_w + 20, 304, half_w);
 
     f.label(hinstance, "启动类型", 14, 338, 60);
-    f.combo(hinstance, ID_STARTUP, 76, 334, 170, &["自动", "自动（延迟启动）", "手动"], 0);
+    f.combo(
+        hinstance,
+        ID_STARTUP,
+        76,
+        334,
+        170,
+        &["自动", "自动（延迟启动）", "手动"],
+        0,
+    );
     f.label(hinstance, "进程优先级", 270, 338, 76);
     f.combo(
         hinstance,
@@ -207,7 +262,13 @@ unsafe fn create_form(st: &mut EditState, hinstance: HINSTANCE) {
     f.label(hinstance, "线程", 394, 432, 40);
     f.edit(hinstance, ID_TMO_T, 436, 428, 80);
 
-    f.label(hinstance, "环境变量 AppEnvironment (替换式, 通常留空; 每行 KEY=VALUE, # 注释)", 14, 462, half_w);
+    f.label(
+        hinstance,
+        "环境变量 AppEnvironment (替换式, 通常留空; 每行 KEY=VALUE, # 注释)",
+        14,
+        462,
+        half_w,
+    );
     f.edit_ml(hinstance, ID_ENV, 14, 480, half_w, 110, false);
     f.label(
         hinstance,
@@ -216,10 +277,73 @@ unsafe fn create_form(st: &mut EditState, hinstance: HINSTANCE) {
         462,
         half_w,
     );
-    f.edit_ml(hinstance, ID_ENV_EXTRA, 14 + half_w + 20, 480, half_w, 110, false);
+    f.edit_ml(
+        hinstance,
+        ID_ENV_EXTRA,
+        14 + half_w + 20,
+        480,
+        half_w,
+        110,
+        false,
+    );
 
-    f.button(hinstance, ID_OK, "保存", right_edge - 224, 604, 104, 30, true);
-    f.button(hinstance, ID_CANCEL, "取消", right_edge - 104, 604, 104, 30, false);
+    // Dependencies + stop-method-skip (previously CLI-only fields).
+    f.label(
+        hinstance,
+        "依赖服务 (逗号分隔, 可选; 导入时非空才会更新)",
+        14,
+        600,
+        half_w,
+    );
+    f.edit(hinstance, ID_DEPS, 14, 618, half_w);
+    f.label(
+        hinstance,
+        "跳过停止级别 (高级; 默认全部执行)",
+        14 + half_w + 20,
+        600,
+        half_w,
+    );
+    let cb_x0 = 14 + half_w + 20;
+    let cb_w = (half_w - 14) / 2;
+    f.checkbox(hinstance, ID_SKIP_C, "1 控制台事件", cb_x0, 618, cb_w);
+    f.checkbox(
+        hinstance,
+        ID_SKIP_W,
+        "2 窗口消息",
+        cb_x0 + cb_w + 14,
+        618,
+        cb_w,
+    );
+    f.checkbox(hinstance, ID_SKIP_T, "4 线程消息", cb_x0, 642, cb_w);
+    f.checkbox(
+        hinstance,
+        ID_SKIP_K,
+        "8 强制终止",
+        cb_x0 + cb_w + 14,
+        642,
+        cb_w,
+    );
+
+    f.button(
+        hinstance,
+        ID_OK,
+        "保存",
+        right_edge - 224,
+        678,
+        104,
+        30,
+        true,
+    );
+    f.button(
+        hinstance,
+        ID_CANCEL,
+        "取消",
+        right_edge - 104,
+        678,
+        104,
+        30,
+        false,
+    );
 }
 
 fn prefill(form: &Form, cfg: &Config) {
@@ -262,6 +386,23 @@ fn prefill(form: &Form, cfg: &Config) {
     form.set_text(ID_TMO_T, &cfg.stop_timeout_threads.to_string());
     form.set_text(ID_ENV, &cfg.environment.join("\r\n"));
     form.set_text(ID_ENV_EXTRA, &cfg.environment_extra.join("\r\n"));
+    form.set_text(ID_DEPS, &cfg.dependencies.join(", "));
+    form.set_checked(
+        ID_SKIP_C,
+        cfg.stop_method_skip & crate::runner::SKIP_CONSOLE != 0,
+    );
+    form.set_checked(
+        ID_SKIP_W,
+        cfg.stop_method_skip & crate::runner::SKIP_WINDOW != 0,
+    );
+    form.set_checked(
+        ID_SKIP_T,
+        cfg.stop_method_skip & crate::runner::SKIP_THREADS != 0,
+    );
+    form.set_checked(
+        ID_SKIP_K,
+        cfg.stop_method_skip & crate::runner::SKIP_TERMINATE != 0,
+    );
 }
 
 // ------------------------------------------------------------ wndproc ----
@@ -286,12 +427,16 @@ unsafe extern "system" fn edit_wndproc(
                     let _ = DestroyWindow(hwnd);
                 }
                 ID_BROWSE_APP => {
-                    if let Some(path) = ctl::pick_open(st.owner, "选择应用程序可执行文件", ctl::PickMode::Exe) {
+                    if let Some(path) =
+                        ctl::pick_open(st.owner, "选择应用程序可执行文件", ctl::PickMode::Exe)
+                    {
                         st.form.set_text(ID_APP, &path);
                     }
                 }
                 ID_BROWSE_DIR => {
-                    if let Some(path) = ctl::pick_open(st.owner, "选择工作目录", ctl::PickMode::Folder) {
+                    if let Some(path) =
+                        ctl::pick_open(st.owner, "选择工作目录", ctl::PickMode::Folder)
+                    {
                         st.form.set_text(ID_DIR, &path);
                     }
                 }
@@ -331,11 +476,21 @@ fn on_save(st: &mut EditState) {
 
     let app = form.text(ID_APP);
     if app.is_empty() {
-        msg_box(st.hwnd(), "应用程序不能为空。", "rssvc", MB_OK | MB_ICONERROR);
+        msg_box(
+            st.hwnd(),
+            "应用程序不能为空。",
+            "rssvc",
+            MB_OK | MB_ICONERROR,
+        );
         return;
     }
     if !std::path::Path::new(&app).is_file() {
-        msg_box(st.hwnd(), "应用程序路径无效或文件不存在。", "rssvc", MB_OK | MB_ICONERROR);
+        msg_box(
+            st.hwnd(),
+            "应用程序路径无效或文件不存在。",
+            "rssvc",
+            MB_OK | MB_ICONERROR,
+        );
         return;
     }
 
@@ -365,7 +520,8 @@ fn on_save(st: &mut EditState) {
         Ok(v) => v,
         Err(e) => return msg_box(st.hwnd(), &e, "rssvc", MB_OK | MB_ICONERROR),
     };
-    let stop_timeout_console = match num("停止超时(控制台)", ID_TMO_C, cfg.stop_timeout_console) {
+    let stop_timeout_console = match num("停止超时(控制台)", ID_TMO_C, cfg.stop_timeout_console)
+    {
         Ok(v) => v,
         Err(e) => return msg_box(st.hwnd(), &e, "rssvc", MB_OK | MB_ICONERROR),
     };
@@ -373,7 +529,8 @@ fn on_save(st: &mut EditState) {
         Ok(v) => v,
         Err(e) => return msg_box(st.hwnd(), &e, "rssvc", MB_OK | MB_ICONERROR),
     };
-    let stop_timeout_threads = match num("停止超时(线程)", ID_TMO_T, cfg.stop_timeout_threads) {
+    let stop_timeout_threads = match num("停止超时(线程)", ID_TMO_T, cfg.stop_timeout_threads)
+    {
         Ok(v) => v,
         Err(e) => return msg_box(st.hwnd(), &e, "rssvc", MB_OK | MB_ICONERROR),
     };
@@ -385,12 +542,29 @@ fn on_save(st: &mut EditState) {
         Ok(v) => v,
         Err(e) => return msg_box(st.hwnd(), &e, "rssvc", MB_OK | MB_ICONERROR),
     };
+    let mut skip = 0u32;
+    if form.checked(ID_SKIP_C) {
+        skip |= crate::runner::SKIP_CONSOLE;
+    }
+    if form.checked(ID_SKIP_W) {
+        skip |= crate::runner::SKIP_WINDOW;
+    }
+    if form.checked(ID_SKIP_T) {
+        skip |= crate::runner::SKIP_THREADS;
+    }
+    if form.checked(ID_SKIP_K) {
+        skip |= crate::runner::SKIP_TERMINATE;
+    }
+    let dependencies: Vec<String> = form
+        .text(ID_DEPS)
+        .split(&[',', ';'][..])
+        .map(|d| d.trim().to_string())
+        .filter(|d| !d.is_empty())
+        .collect();
 
     // Apply to the freshly loaded config so untouched advanced fields
-    // (stop_method_skip, dependencies, account ...) are preserved as-is.
-    cfg.application = std::fs::canonicalize(&app)
-        .map(|p| p.to_string_lossy().to_string())
-        .unwrap_or_else(|_| app.clone());
+    // (account ...) are preserved as-is.
+    cfg.application = util::canonicalize_plain(&app);
     let dir = form.text(ID_DIR);
     cfg.app_directory = if dir.is_empty() {
         std::path::Path::new(&cfg.application)
@@ -415,6 +589,8 @@ fn on_save(st: &mut EditState) {
     cfg.stop_timeout_threads = stop_timeout_threads;
     cfg.environment = environment;
     cfg.environment_extra = environment_extra;
+    cfg.stop_method_skip = skip;
+    cfg.dependencies = dependencies;
     let su = form.combo_sel(ID_STARTUP, 0);
     cfg.startup = if su == 2 { START_MANUAL } else { START_AUTO };
     cfg.delayed_autostart = su == 1;
@@ -430,11 +606,21 @@ fn on_save(st: &mut EditState) {
 
     // ---- persist ----------------------------------------------------------
     if let Err(e) = cfg.save_parameters(&name) {
-        msg_box(st.hwnd(), &format!("写入注册表配置失败: {e}"), "rssvc 保存失败", MB_OK | MB_ICONERROR);
+        msg_box(
+            st.hwnd(),
+            &format!("写入注册表配置失败: {e}"),
+            "rssvc 保存失败",
+            MB_OK | MB_ICONERROR,
+        );
         return;
     }
     if let Err(e) = cfg.save_delayed_flag(&name) {
-        msg_box(st.hwnd(), &format!("写入延迟启动标志失败: {e}"), "rssvc 保存失败", MB_OK | MB_ICONERROR);
+        msg_box(
+            st.hwnd(),
+            &format!("写入延迟启动标志失败: {e}"),
+            "rssvc 保存失败",
+            MB_OK | MB_ICONERROR,
+        );
         return;
     }
 
@@ -458,19 +644,11 @@ fn on_save(st: &mut EditState) {
     // Best-effort: notify the running service so rotation settings apply now.
     notify_param_change(&name);
 
+    // Ask whether to restart now (MB_YESNO + IDYES via the shared helper:
+    // the old MB_OKCANCEL + IDYES mismatch never triggered the restart).
     let text = "配置已保存。\n\n日志轮转参数已实时下发到运行中的服务；\n其余参数将在服务重启后生效。\n\n是否立即重启该服务？";
-    let wtext = util::to_wide(text);
-    let cap = util::to_wide("rssvc 保存成功");
-    let r = unsafe {
-        windows::Win32::UI::WindowsAndMessaging::MessageBoxW(
-            Some(st.hwnd()),
-            PCWSTR::from_raw(wtext.as_ptr()),
-            PCWSTR::from_raw(cap.as_ptr()),
-            MB_OKCANCEL | MB_ICONQUESTION | MB_SETFOREGROUND | MB_TOPMOST,
-        )
-    };
-    if r.0 == 6 {
-        // IDYES: restart via the main window's background operation queue.
+    if ctl::ask_yes_no(st.hwnd(), text, "rssvc 保存成功") {
+        // Restart via the main window's background operation queue.
         request_op(st.owner, name.clone(), OP_RESTART);
     }
     unsafe {
@@ -481,9 +659,15 @@ fn on_save(st: &mut EditState) {
 
 fn notify_param_change(name: &str) {
     use windows::Win32::System::Services::CloseServiceHandle;
-    let Ok(scm) = crate::scm::open_manager(true) else { return };
+    let Ok(scm) = crate::scm::open_manager(true) else {
+        return;
+    };
     let sent = (|| -> Result<(), String> {
-        let svc = crate::scm::open_service(scm, name, crate::scm::ACCESS_PAUSE | crate::scm::ACCESS_QUERY)?;
+        let svc = crate::scm::open_service(
+            scm,
+            name,
+            crate::scm::ACCESS_PAUSE | crate::scm::ACCESS_QUERY,
+        )?;
         let _ = crate::scm::control(&svc, crate::scm::CONTROL_PARAMCHANGE);
         Ok(())
     })();

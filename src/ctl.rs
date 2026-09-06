@@ -7,23 +7,23 @@
 use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
-    CreateFontW, CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS, DEFAULT_CHARSET, FONT_CLIP_PRECISION,
-    FONT_CHARSET, FONT_OUTPUT_PRECISION, FONT_QUALITY, FW_NORMAL, HFONT, OUT_DEFAULT_PRECIS,
+    CreateFontW, CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS, DEFAULT_CHARSET, FONT_CHARSET,
+    FONT_CLIP_PRECISION, FONT_OUTPUT_PRECISION, FONT_QUALITY, FW_NORMAL, HFONT, OUT_DEFAULT_PRECIS,
 };
 use windows::Win32::System::Com::{CoCreateInstance, CoTaskMemFree, CLSCTX_INPROC_SERVER};
 use windows::Win32::UI::Shell::{
-    FileOpenDialog, FileSaveDialog, FOS_FORCEFILESYSTEM, FOS_FILEMUSTEXIST, FOS_OVERWRITEPROMPT,
-    FOS_PICKFOLDERS, IFileOpenDialog, IFileSaveDialog, SIGDN_FILESYSPATH,
+    FileOpenDialog, FileSaveDialog, IFileOpenDialog, IFileSaveDialog, FOS_FILEMUSTEXIST,
+    FOS_FORCEFILESYSTEM, FOS_OVERWRITEPROMPT, FOS_PICKFOLDERS, SIGDN_FILESYSPATH,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    AdjustWindowRectEx, CreateWindowExW, GetWindowRect, SendMessageW, WINDOW_EX_STYLE,
-    WINDOW_STYLE, WS_CAPTION, WS_CHILD, WS_EX_CLIENTEDGE, WS_SYSMENU, WS_TABSTOP, WS_VISIBLE,
-    WS_VSCROLL,
+    AdjustWindowRectEx, CreateWindowExW, GetWindowRect, MessageBoxW, SendMessageW, MB_ICONQUESTION,
+    MB_YESNO, WINDOW_EX_STYLE, WINDOW_STYLE, WS_CAPTION, WS_CHILD, WS_EX_CLIENTEDGE, WS_SYSMENU,
+    WS_TABSTOP, WS_VISIBLE, WS_VSCROLL,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    BS_AUTOCHECKBOX, BS_DEFPUSHBUTTON, BS_PUSHBUTTON, CB_ADDSTRING, CB_GETCURSEL, CB_SETCURSEL,
-    CBS_DROPDOWNLIST, CW_USEDEFAULT, ES_AUTOHSCROLL, ES_AUTOVSCROLL, ES_MULTILINE, ES_READONLY,
-    ES_WANTRETURN, WM_SETFONT, WM_SETTEXT,
+    BM_GETCHECK, BM_SETCHECK, BS_AUTOCHECKBOX, BS_DEFPUSHBUTTON, BS_PUSHBUTTON, CBS_DROPDOWNLIST,
+    CB_ADDSTRING, CB_GETCURSEL, CB_SETCURSEL, CW_USEDEFAULT, ES_AUTOHSCROLL, ES_AUTOVSCROLL,
+    ES_MULTILINE, ES_READONLY, ES_WANTRETURN, WM_SETFONT, WM_SETTEXT,
 };
 
 use crate::util;
@@ -34,8 +34,14 @@ use crate::util;
 pub fn ui_font() -> HFONT {
     unsafe {
         CreateFontW(
-            -12, 0, 0, 0,
-            FW_NORMAL.0 as i32, 0, 0, 0,
+            -12,
+            0,
+            0,
+            0,
+            FW_NORMAL.0 as i32,
+            0,
+            0,
+            0,
             FONT_CHARSET(DEFAULT_CHARSET.0),
             FONT_OUTPUT_PRECISION(OUT_DEFAULT_PRECIS.0),
             FONT_CLIP_PRECISION(CLIP_DEFAULT_PRECIS.0),
@@ -50,8 +56,14 @@ pub fn ui_font() -> HFONT {
 pub fn mono_font() -> HFONT {
     unsafe {
         CreateFontW(
-            -13, 0, 0, 0,
-            FW_NORMAL.0 as i32, 0, 0, 0,
+            -13,
+            0,
+            0,
+            0,
+            FW_NORMAL.0 as i32,
+            0,
+            0,
+            0,
             FONT_CHARSET(DEFAULT_CHARSET.0),
             FONT_OUTPUT_PRECISION(OUT_DEFAULT_PRECIS.0),
             FONT_CLIP_PRECISION(CLIP_DEFAULT_PRECIS.0),
@@ -72,6 +84,8 @@ pub struct Form {
     pub hfont: HFONT,
 }
 
+// Win32 control builders naturally take (id, x, y, w, h, ...) tuples.
+#[allow(clippy::too_many_arguments)]
 impl Form {
     pub fn new(hwnd: HWND) -> Form {
         Form {
@@ -84,7 +98,12 @@ impl Form {
     /// Apply the shared UI font to an externally created control.
     pub fn apply_font(&self, h: HWND) {
         unsafe {
-            SendMessageW(h, WM_SETFONT, Some(WPARAM(self.hfont.0 as usize)), Some(LPARAM(1)));
+            SendMessageW(
+                h,
+                WM_SETFONT,
+                Some(WPARAM(self.hfont.0 as usize)),
+                Some(LPARAM(1)),
+            );
         }
     }
 
@@ -99,8 +118,14 @@ impl Form {
             w!("STATIC"),
             PCWSTR::from_raw(t.as_ptr()),
             WINDOW_STYLE(WS_CHILD.0 | WS_VISIBLE.0),
-            x, y, w, 16,
-            Some(self.hwnd), None, Some(hinstance), None,
+            x,
+            y,
+            w,
+            16,
+            Some(self.hwnd),
+            None,
+            Some(hinstance),
+            None,
         ) {
             self.apply_font(h);
         }
@@ -116,7 +141,10 @@ impl Form {
         &mut self,
         hinstance: HINSTANCE,
         id: u32,
-        x: i32, y: i32, w: i32, h: i32,
+        x: i32,
+        y: i32,
+        w: i32,
+        h: i32,
         readonly: bool,
     ) {
         let ro = if readonly { ES_READONLY as u32 } else { 0 };
@@ -125,11 +153,23 @@ impl Form {
             w!("EDIT"),
             w!(""),
             WINDOW_STYLE(
-                WS_CHILD.0 | WS_VISIBLE.0 | WS_TABSTOP.0 | WS_VSCROLL.0
-                    | ES_MULTILINE as u32 | ES_AUTOVSCROLL as u32 | ES_WANTRETURN as u32 | ro,
+                WS_CHILD.0
+                    | WS_VISIBLE.0
+                    | WS_TABSTOP.0
+                    | WS_VSCROLL.0
+                    | ES_MULTILINE as u32
+                    | ES_AUTOVSCROLL as u32
+                    | ES_WANTRETURN as u32
+                    | ro,
             ),
-            x, y, w, h,
-            Some(self.hwnd), Some(HMENU_ID(id)), Some(hinstance), None,
+            x,
+            y,
+            w,
+            h,
+            Some(self.hwnd),
+            Some(HMENU_ID(id)),
+            Some(hinstance),
+            None,
         ) {
             self.apply_font(h);
             self.push(id, h);
@@ -140,7 +180,10 @@ impl Form {
         &mut self,
         hinstance: HINSTANCE,
         id: u32,
-        x: i32, y: i32, w: i32, h: i32,
+        x: i32,
+        y: i32,
+        w: i32,
+        h: i32,
         _multiline: bool,
     ) {
         unsafe {
@@ -149,8 +192,14 @@ impl Form {
                 w!("EDIT"),
                 w!(""),
                 WINDOW_STYLE(WS_CHILD.0 | WS_VISIBLE.0 | WS_TABSTOP.0 | ES_AUTOHSCROLL as u32),
-                x, y, w, h,
-                Some(self.hwnd), Some(HMENU_ID(id)), Some(hinstance), None,
+                x,
+                y,
+                w,
+                h,
+                Some(self.hwnd),
+                Some(HMENU_ID(id)),
+                Some(hinstance),
+                None,
             ) {
                 self.apply_font(h);
                 self.push(id, h);
@@ -163,7 +212,10 @@ impl Form {
         hinstance: HINSTANCE,
         id: u32,
         text: &str,
-        x: i32, y: i32, w: i32, h: i32,
+        x: i32,
+        y: i32,
+        w: i32,
+        h: i32,
         def: bool,
     ) {
         let t = util::to_wide(text);
@@ -173,8 +225,14 @@ impl Form {
             w!("BUTTON"),
             PCWSTR::from_raw(t.as_ptr()),
             WINDOW_STYLE(WS_CHILD.0 | WS_VISIBLE.0 | WS_TABSTOP.0 | bs as u32),
-            x, y, w, h,
-            Some(self.hwnd), Some(HMENU_ID(id)), Some(hinstance), None,
+            x,
+            y,
+            w,
+            h,
+            Some(self.hwnd),
+            Some(HMENU_ID(id)),
+            Some(hinstance),
+            None,
         ) {
             self.apply_font(h);
             self.push(id, h);
@@ -186,7 +244,9 @@ impl Form {
         hinstance: HINSTANCE,
         id: u32,
         text: &str,
-        x: i32, y: i32, w: i32,
+        x: i32,
+        y: i32,
+        w: i32,
     ) -> HWND {
         let t = util::to_wide(text);
         match CreateWindowExW(
@@ -194,8 +254,14 @@ impl Form {
             w!("BUTTON"),
             PCWSTR::from_raw(t.as_ptr()),
             WINDOW_STYLE(WS_CHILD.0 | WS_VISIBLE.0 | WS_TABSTOP.0 | BS_AUTOCHECKBOX as u32),
-            x, y, w, 22,
-            Some(self.hwnd), Some(HMENU_ID(id)), Some(hinstance), None,
+            x,
+            y,
+            w,
+            22,
+            Some(self.hwnd),
+            Some(HMENU_ID(id)),
+            Some(hinstance),
+            None,
         ) {
             Ok(h) => {
                 self.apply_font(h);
@@ -215,7 +281,9 @@ impl Form {
         &mut self,
         hinstance: HINSTANCE,
         id: u32,
-        x: i32, y: i32, w: i32,
+        x: i32,
+        y: i32,
+        w: i32,
         items: &[&str],
         sel: i32,
     ) {
@@ -224,18 +292,33 @@ impl Form {
             w!("COMBOBOX"),
             w!(""),
             WINDOW_STYLE(
-                WS_CHILD.0 | WS_VISIBLE.0 | WS_TABSTOP.0 | WS_VSCROLL.0
-                    | CBS_DROPDOWNLIST as u32,
+                WS_CHILD.0 | WS_VISIBLE.0 | WS_TABSTOP.0 | WS_VSCROLL.0 | CBS_DROPDOWNLIST as u32,
             ),
-            x, y, w, 160,
-            Some(self.hwnd), Some(HMENU_ID(id)), Some(hinstance), None,
+            x,
+            y,
+            w,
+            160,
+            Some(self.hwnd),
+            Some(HMENU_ID(id)),
+            Some(hinstance),
+            None,
         ) {
             self.apply_font(h);
             for it in items {
                 let t = util::to_wide(it);
-                SendMessageW(h, CB_ADDSTRING, Some(WPARAM(0)), Some(LPARAM(t.as_ptr() as isize)));
+                SendMessageW(
+                    h,
+                    CB_ADDSTRING,
+                    Some(WPARAM(0)),
+                    Some(LPARAM(t.as_ptr() as isize)),
+                );
             }
-            SendMessageW(h, CB_SETCURSEL, Some(WPARAM(sel.max(0) as usize)), Some(LPARAM(0)));
+            SendMessageW(
+                h,
+                CB_SETCURSEL,
+                Some(WPARAM(sel.max(0) as usize)),
+                Some(LPARAM(0)),
+            );
             self.push(id, h);
         }
     }
@@ -270,7 +353,12 @@ impl Form {
         }
         let t = util::to_wide(s);
         unsafe {
-            SendMessageW(h, WM_SETTEXT, Some(WPARAM(0)), Some(LPARAM(t.as_ptr() as isize)));
+            SendMessageW(
+                h,
+                WM_SETTEXT,
+                Some(WPARAM(0)),
+                Some(LPARAM(t.as_ptr() as isize)),
+            );
         }
     }
 
@@ -293,9 +381,59 @@ impl Form {
             return;
         }
         unsafe {
-            SendMessageW(h, CB_SETCURSEL, Some(WPARAM(idx.max(0) as usize)), Some(LPARAM(0)));
+            SendMessageW(
+                h,
+                CB_SETCURSEL,
+                Some(WPARAM(idx.max(0) as usize)),
+                Some(LPARAM(0)),
+            );
         }
     }
+
+    /// Read an auto-checkbox state (true = checked).
+    pub fn checked(&self, id: u32) -> bool {
+        let h = self.ctl(id);
+        if h.is_invalid() {
+            return false;
+        }
+        // BM_GETCHECK returns BST_CHECKED(1) / BST_UNCHECKED(0).
+        unsafe { SendMessageW(h, BM_GETCHECK, None, None).0 == 1 }
+    }
+
+    /// Set an auto-checkbox state.
+    pub fn set_checked(&self, id: u32, on: bool) {
+        let h = self.ctl(id);
+        if h.is_invalid() {
+            return;
+        }
+        unsafe {
+            SendMessageW(
+                h,
+                BM_SETCHECK,
+                Some(WPARAM(if on { 1 } else { 0 })),
+                Some(LPARAM(0)),
+            );
+        }
+    }
+}
+
+/// The ONE correct way to ask a yes/no question. Using MB_YESNO and comparing
+/// against IDYES keeps the button set and the return value in sync — mixing
+/// MB_OKCANCEL (returns IDOK/IDCANCEL) with an IDYES comparison silently
+/// breaks the interaction no matter what the user clicks.
+pub fn ask_yes_no(parent: HWND, text: &str, title: &str) -> bool {
+    const IDYES: i32 = 6;
+    let t = util::to_wide(text);
+    let cap = util::to_wide(title);
+    let r = unsafe {
+        MessageBoxW(
+            Some(parent),
+            PCWSTR::from_raw(t.as_ptr()),
+            PCWSTR::from_raw(cap.as_ptr()),
+            MB_YESNO | MB_ICONQUESTION,
+        )
+    };
+    r.0 == IDYES
 }
 
 /// Control ID as HMENU (Win32 passes control IDs through this field).
@@ -312,7 +450,12 @@ pub fn HMENU_ID(id: u32) -> windows::Win32::UI::WindowsAndMessaging::HMENU {
 /// size; passing the client size directly crops the bottom of the form
 /// (title bar + borders eat roughly 40 px).
 pub fn outer_size_for_client(cw: i32, ch: i32) -> (i32, i32) {
-    let mut r = RECT { left: 0, top: 0, right: cw, bottom: ch };
+    let mut r = RECT {
+        left: 0,
+        top: 0,
+        right: cw,
+        bottom: ch,
+    };
     unsafe {
         let _ = AdjustWindowRectEx(
             &mut r,
@@ -365,7 +508,9 @@ pub fn pick_open(owner: HWND, title: &str, mode: PickMode) -> Option<String> {
             PickMode::Folder => FOS_PICKFOLDERS.0 | FOS_FORCEFILESYSTEM.0,
             PickMode::Any => FOS_FILEMUSTEXIST.0 | FOS_FORCEFILESYSTEM.0,
         };
-        let _ = dlg.SetOptions(windows::Win32::UI::Shell::FILEOPENDIALOGOPTIONS(opts | extra));
+        let _ = dlg.SetOptions(windows::Win32::UI::Shell::FILEOPENDIALOGOPTIONS(
+            opts | extra,
+        ));
         let t = util::to_wide(title);
         let _ = dlg.SetTitle(PCWSTR::from_raw(t.as_ptr()));
         if dlg.Show(Some(owner)).is_err() {
@@ -431,5 +576,27 @@ pub fn parse_env_text(s: &str) -> Result<Vec<String>, String> {
 /// Set the text of an arbitrary HWND (helper for non-Form controls).
 pub unsafe fn set_window_text(h: HWND, s: &str) {
     let t = util::to_wide(s);
-    SendMessageW(h, WM_SETTEXT, Some(WPARAM(0)), Some(LPARAM(t.as_ptr() as isize)));
+    SendMessageW(
+        h,
+        WM_SETTEXT,
+        Some(WPARAM(0)),
+        Some(LPARAM(t.as_ptr() as isize)),
+    );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn env_text_parsing() {
+        let ok = "KEY=value\r\n# comment\r\n\r\nPATH=C:\\bin;C:\\usr\r\nX=1=2";
+        let v = parse_env_text(ok).unwrap();
+        assert_eq!(v, vec!["KEY=value", "PATH=C:\\bin;C:\\usr", "X=1=2"]);
+        assert!(parse_env_text("").unwrap().is_empty());
+        assert!(parse_env_text("# only a comment").unwrap().is_empty());
+        // Missing '=' or empty key is an error.
+        assert!(parse_env_text("NOEQUALS").is_err());
+        assert!(parse_env_text("=value").is_err());
+    }
 }

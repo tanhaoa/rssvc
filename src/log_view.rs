@@ -15,15 +15,17 @@ use std::path::PathBuf;
 use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
-use windows::Win32::UI::Controls::{EM_REPLACESEL, EM_SCROLLCARET, EM_SETLIMITTEXT, EM_SETSEL, BST_CHECKED};
+use windows::Win32::UI::Controls::{
+    BST_CHECKED, EM_REPLACESEL, EM_SCROLLCARET, EM_SETLIMITTEXT, EM_SETSEL,
+};
 use windows::Win32::UI::WindowsAndMessaging::{
-    CBS_DROPDOWNLIST, CreateWindowExW, DefWindowProcW, DestroyWindow, GetWindowLongPtrW,
-    KillTimer, LoadCursorW, MoveWindow, RegisterClassExW, SendMessageW, SetForegroundWindow,
-    SetTimer, SetWindowLongPtrW, ShowWindow, BM_GETCHECK, CB_ADDSTRING, CB_GETCURSEL,
-    CB_SETCURSEL, CBN_SELCHANGE, GWLP_USERDATA, IDC_ARROW, MB_ICONERROR, MB_ICONINFORMATION,
-    MB_OK, SW_SHOW, WM_CLOSE, WM_COMMAND, WM_DESTROY, WM_GETTEXTLENGTH, WM_SETFONT, WM_SIZE,
-    WM_TIMER, WINDOW_EX_STYLE, WINDOW_STYLE, WNDCLASSEXW, WS_CAPTION, WS_CHILD,
-    WS_EX_CLIENTEDGE, WS_SYSMENU, WS_TABSTOP, WS_VSCROLL, WS_VISIBLE,
+    CreateWindowExW, DefWindowProcW, DestroyWindow, GetWindowLongPtrW, KillTimer, LoadCursorW,
+    MoveWindow, RegisterClassExW, SendMessageW, SetForegroundWindow, SetTimer, SetWindowLongPtrW,
+    ShowWindow, BM_GETCHECK, CBN_SELCHANGE, CBS_DROPDOWNLIST, CB_ADDSTRING, CB_GETCURSEL,
+    CB_SETCURSEL, GWLP_USERDATA, IDC_ARROW, MB_ICONERROR, MB_ICONINFORMATION, MB_OK, SW_SHOW,
+    WINDOW_EX_STYLE, WINDOW_STYLE, WM_CLOSE, WM_COMMAND, WM_DESTROY, WM_GETTEXTLENGTH, WM_SETFONT,
+    WM_SIZE, WM_TIMER, WNDCLASSEXW, WS_CAPTION, WS_CHILD, WS_EX_CLIENTEDGE, WS_SYSMENU, WS_TABSTOP,
+    WS_VISIBLE, WS_VSCROLL,
 };
 
 use crate::config::Config;
@@ -94,7 +96,9 @@ pub fn open_log_viewer(owner: HWND, name: &str, cfg: &Config) {
     }
 
     unsafe {
-        let Ok(hmodule) = GetModuleHandleW(PCWSTR::null()) else { return };
+        let Ok(hmodule) = GetModuleHandleW(PCWSTR::null()) else {
+            return;
+        };
         let hinstance = HINSTANCE(hmodule.0);
         register_class(hinstance);
 
@@ -150,15 +154,17 @@ fn new_stream(path: &str) -> Stream {
 fn register_class(hinstance: HINSTANCE) {
     static REGISTERED: std::sync::Once = std::sync::Once::new();
     REGISTERED.call_once(|| unsafe {
-        let mut wc = WNDCLASSEXW::default();
-        wc.cbSize = std::mem::size_of::<WNDCLASSEXW>() as u32;
-        wc.lpfnWndProc = Some(log_wndproc);
-        wc.hInstance = hinstance;
-        wc.hCursor = LoadCursorW(None, IDC_ARROW).unwrap_or_default();
-        wc.hbrBackground = windows::Win32::Graphics::Gdi::HBRUSH(
-            (windows::Win32::Graphics::Gdi::COLOR_WINDOW.0 + 1) as *mut core::ffi::c_void,
-        );
-        wc.lpszClassName = w!("rssvcLogWnd");
+        let wc = WNDCLASSEXW {
+            cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
+            lpfnWndProc: Some(log_wndproc),
+            hInstance: hinstance,
+            hCursor: LoadCursorW(None, IDC_ARROW).unwrap_or_default(),
+            hbrBackground: windows::Win32::Graphics::Gdi::HBRUSH(
+                (windows::Win32::Graphics::Gdi::COLOR_WINDOW.0 + 1) as *mut core::ffi::c_void,
+            ),
+            lpszClassName: w!("rssvcLogWnd"),
+            ..Default::default()
+        };
         RegisterClassExW(&wc);
     });
 }
@@ -174,11 +180,16 @@ unsafe fn create_controls(lv: &mut LogView, hinstance: HINSTANCE) {
         // CBS_DROPDOWNLIST is mandatory: without it Win32 falls back to
         // CBS_SIMPLE (list always expanded) which covers the log area.
         WINDOW_STYLE(
-            WS_CHILD.0 | WS_VISIBLE.0 | WS_TABSTOP.0 | WS_VSCROLL.0
-                | CBS_DROPDOWNLIST as u32,
+            WS_CHILD.0 | WS_VISIBLE.0 | WS_TABSTOP.0 | WS_VSCROLL.0 | CBS_DROPDOWNLIST as u32,
         ),
-        56, 8, 560, 200,
-        Some(f.hwnd), Some(HMENU_ID(ID_FILE)), Some(hinstance), None,
+        56,
+        8,
+        560,
+        200,
+        Some(f.hwnd),
+        Some(HMENU_ID(ID_FILE)),
+        Some(hinstance),
+        None,
     ) {
         Ok(h) => {
             f.apply_font(h);
@@ -186,7 +197,12 @@ unsafe fn create_controls(lv: &mut LogView, hinstance: HINSTANCE) {
                 let label = if i == 0 { "stdout" } else { "stderr" };
                 let item = format!("{label} — {}", s.path.display());
                 let t = util::to_wide(&item);
-                SendMessageW(h, CB_ADDSTRING, Some(WPARAM(0)), Some(LPARAM(t.as_ptr() as isize)));
+                SendMessageW(
+                    h,
+                    CB_ADDSTRING,
+                    Some(WPARAM(0)),
+                    Some(LPARAM(t.as_ptr() as isize)),
+                );
             }
             SendMessageW(h, CB_SETCURSEL, Some(WPARAM(0)), Some(LPARAM(0)));
             h
@@ -204,20 +220,36 @@ unsafe fn create_controls(lv: &mut LogView, hinstance: HINSTANCE) {
         w!("EDIT"),
         w!(""),
         WINDOW_STYLE(
-            WS_CHILD.0 | WS_VISIBLE.0 | WS_TABSTOP.0 | WS_VSCROLL.0
+            WS_CHILD.0
+                | WS_VISIBLE.0
+                | WS_TABSTOP.0
+                | WS_VSCROLL.0
                 | windows::Win32::UI::WindowsAndMessaging::ES_MULTILINE as u32
                 | windows::Win32::UI::WindowsAndMessaging::ES_AUTOVSCROLL as u32
                 | windows::Win32::UI::WindowsAndMessaging::ES_READONLY as u32,
         ),
-        12, 40, VIEW_W - 24, VIEW_H - 120,
-        Some(f.hwnd), None, Some(hinstance), None,
+        12,
+        40,
+        VIEW_W - 24,
+        VIEW_H - 120,
+        Some(f.hwnd),
+        None,
+        Some(hinstance),
+        None,
     );
-    lv.edit = match edit {
-        Ok(h) => h,
-        Err(_) => HWND::default(),
-    };
-    SendMessageW(lv.edit, WM_SETFONT, Some(WPARAM(mono.0 as usize)), Some(LPARAM(1)));
-    SendMessageW(lv.edit, EM_SETLIMITTEXT, Some(WPARAM(0x7FFFFFFE)), Some(LPARAM(0)));
+    lv.edit = edit.unwrap_or_default();
+    SendMessageW(
+        lv.edit,
+        WM_SETFONT,
+        Some(WPARAM(mono.0 as usize)),
+        Some(LPARAM(1)),
+    );
+    SendMessageW(
+        lv.edit,
+        EM_SETLIMITTEXT,
+        Some(WPARAM(0x7FFFFFFE)),
+        Some(LPARAM(0)),
+    );
 }
 
 // ------------------------------------------------------------ reading ----
@@ -331,7 +363,12 @@ fn read_more(s: &mut Stream) -> Upd {
 
 unsafe fn scroll_end(edit: HWND) {
     let len = SendMessageW(edit, WM_GETTEXTLENGTH, None, None).0;
-    SendMessageW(edit, EM_SETSEL, Some(WPARAM(len as usize)), Some(LPARAM(len as isize)));
+    SendMessageW(
+        edit,
+        EM_SETSEL,
+        Some(WPARAM(len as usize)),
+        Some(LPARAM(len as isize)),
+    );
     SendMessageW(edit, EM_SCROLLCARET, None, None);
 }
 
@@ -346,8 +383,18 @@ unsafe fn apply(lv: &mut LogView, upd: Upd) {
         Upd::Append(piece) => {
             let w = util::to_wide(&piece);
             let len = SendMessageW(lv.edit, WM_GETTEXTLENGTH, None, None).0;
-            SendMessageW(lv.edit, EM_SETSEL, Some(WPARAM(len as usize)), Some(LPARAM(len as isize)));
-            SendMessageW(lv.edit, EM_REPLACESEL, Some(WPARAM(1)), Some(LPARAM(w.as_ptr() as isize)));
+            SendMessageW(
+                lv.edit,
+                EM_SETSEL,
+                Some(WPARAM(len as usize)),
+                Some(LPARAM(len as isize)),
+            );
+            SendMessageW(
+                lv.edit,
+                EM_REPLACESEL,
+                Some(WPARAM(1)),
+                Some(LPARAM(w.as_ptr() as isize)),
+            );
             SendMessageW(lv.edit, EM_SCROLLCARET, None, None);
         }
     }
@@ -424,7 +471,9 @@ unsafe extern "system" fn log_wndproc(
         WM_SIZE => {
             let cw = (lparam.0 & 0xffff) as i32;
             let ch = ((lparam.0 >> 16) & 0xffff) as i32;
-            if ch > 60 {
+            // Guard both dimensions: extreme shrink must not compute a
+            // negative width/height for MoveWindow.
+            if cw > 40 && ch > 60 {
                 let _ = MoveWindow(lv.edit, 12, 40, cw - 24, ch - 52, true);
             }
             LRESULT(0)

@@ -13,46 +13,40 @@ use windows::Win32::Foundation::{
     CloseHandle, FILETIME, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM,
 };
 use windows::Win32::Graphics::Gdi::{
-    CreateFontW, COLOR_WINDOW, CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS, DEFAULT_CHARSET,
-    FONT_CLIP_PRECISION, FONT_CHARSET, FONT_OUTPUT_PRECISION, FONT_QUALITY, FW_NORMAL, HFONT,
+    CreateFontW, CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS, COLOR_WINDOW, DEFAULT_CHARSET,
+    FONT_CHARSET, FONT_CLIP_PRECISION, FONT_OUTPUT_PRECISION, FONT_QUALITY, FW_NORMAL, HFONT,
     OUT_DEFAULT_PRECIS,
 };
-use windows::Win32::System::Com::{
-    CoInitializeEx, COINIT_APARTMENTTHREADED,
-};
+use windows::Win32::System::Com::{CoInitializeEx, COINIT_APARTMENTTHREADED};
 use windows::Win32::System::Console::{FreeConsole, GetConsoleProcessList, GetConsoleWindow};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
-use windows::Win32::System::ProcessStatus::{
-    GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS,
-};
+use windows::Win32::System::ProcessStatus::{GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS};
 use windows::Win32::System::SystemInformation::GetSystemTimeAsFileTime;
 use windows::Win32::System::Threading::{
     GetProcessTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
 };
 use windows::Win32::UI::Controls::{
     InitCommonControlsEx, ICC_LISTVIEW_CLASSES, INITCOMMONCONTROLSEX, LIST_VIEW_ITEM_FLAGS,
-    LVM_DELETEALLITEMS, LVM_GETNEXTITEM, LVM_INSERTCOLUMN, LVM_INSERTITEM, LVM_SETEXTENDEDLISTVIEWSTYLE,
-    LVM_SETITEMSTATE, LVM_SETITEMTEXT, LVIF_PARAM, LVIF_STATE, LVIF_TEXT, LVITEMW,
-    LVNI_SELECTED, LVN_ITEMCHANGED, LVCOLUMNW, LVCOLUMNW_MASK, LVS_EX_FULLROWSELECT,
+    LVCOLUMNW, LVCOLUMNW_MASK, LVIF_PARAM, LVIF_STATE, LVIF_TEXT, LVITEMW, LVM_DELETEALLITEMS,
+    LVM_GETNEXTITEM, LVM_INSERTCOLUMN, LVM_INSERTITEM, LVM_SETEXTENDEDLISTVIEWSTYLE,
+    LVM_SETITEMSTATE, LVM_SETITEMTEXT, LVNI_SELECTED, LVN_ITEMCHANGED, LVS_EX_FULLROWSELECT,
     LVS_EX_GRIDLINES, LVS_REPORT, LVS_SHOWSELALWAYS, LVS_SINGLESEL, NMHDR,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::EnableWindow;
 use windows::Win32::UI::Shell::{IsUserAnAdmin, ShellExecuteW};
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DispatchMessageW, GetMessageW, GetWindowLongPtrW,
-    GetClientRect, GWLP_USERDATA, HMENU, IDC_ARROW, LoadCursorW, MB_ICONERROR,
-    MB_ICONINFORMATION, MB_ICONWARNING, MB_OK, MB_OKCANCEL, MESSAGEBOX_STYLE, MINMAXINFO, MSG,
-    MessageBoxW, MoveWindow, PostMessageW, PostQuitMessage, RegisterClassExW, SendMessageW,
-    SetForegroundWindow, SetProcessDPIAware, SetTimer, SetWindowLongPtrW, ShowWindow,
-    SW_HIDE, SW_SHOW, SW_SHOWNORMAL, TranslateMessage, WM_APP, WM_COMMAND, WM_DESTROY,
-    WM_GETMINMAXINFO, WM_NOTIFY, WM_SETFONT, WM_SIZE, WM_TIMER, WNDCLASSEXW,
-    WS_CHILD, WS_EX_CLIENTEDGE, WS_OVERLAPPEDWINDOW, WS_TABSTOP, WS_VISIBLE, WS_VSCROLL,
+    CreateWindowExW, DefWindowProcW, DispatchMessageW, GetClientRect, GetMessageW,
+    GetWindowLongPtrW, KillTimer, LoadCursorW, MessageBoxW, MoveWindow, PostMessageW,
+    PostQuitMessage, RegisterClassExW, SendMessageW, SetForegroundWindow, SetProcessDPIAware,
+    SetTimer, SetWindowLongPtrW, ShowWindow, TranslateMessage, GWLP_USERDATA, HMENU, IDC_ARROW,
+    MB_ICONERROR, MB_ICONINFORMATION, MB_OK, MESSAGEBOX_STYLE, MINMAXINFO, MSG, SW_HIDE, SW_SHOW,
+    SW_SHOWNORMAL, WM_APP, WM_COMMAND, WM_DESTROY, WM_GETMINMAXINFO, WM_NOTIFY, WM_SETFONT,
+    WM_SIZE, WM_TIMER, WNDCLASSEXW, WS_CHILD, WS_EX_CLIENTEDGE, WS_OVERLAPPEDWINDOW, WS_TABSTOP,
+    WS_VISIBLE, WS_VSCROLL,
 };
 
-// Message-box "Yes" result value (MESSAGEBOX_RESULT(6)).
-const IDYES_RAW: i32 = 6;
-
 use crate::config::Config;
+use crate::ctl;
 use crate::util;
 
 // ------------------------------------------------------------- constants --
@@ -154,8 +148,14 @@ pub fn launch() -> ! {
         let hwnd = create_main_window(hinstance);
 
         let hfont = CreateFontW(
-            -12, 0, 0, 0,
-            FW_NORMAL.0 as i32, 0, 0, 0,
+            -12,
+            0,
+            0,
+            0,
+            FW_NORMAL.0 as i32,
+            0,
+            0,
+            0,
             FONT_CHARSET(DEFAULT_CHARSET.0),
             FONT_OUTPUT_PRECISION(OUT_DEFAULT_PRECIS.0),
             FONT_CLIP_PRECISION(CLIP_DEFAULT_PRECIS.0),
@@ -199,19 +199,21 @@ pub fn launch() -> ! {
 
 fn register_class(hinstance: HINSTANCE) {
     let cls = w!("rssvcMainWnd");
-    let mut wc = WNDCLASSEXW::default();
-    wc.cbSize = std::mem::size_of::<WNDCLASSEXW>() as u32;
-    wc.style = windows::Win32::UI::WindowsAndMessaging::WNDCLASS_STYLES(
-        windows::Win32::UI::WindowsAndMessaging::CS_HREDRAW.0
-            | windows::Win32::UI::WindowsAndMessaging::CS_VREDRAW.0,
-    );
-    wc.lpfnWndProc = Some(main_wndproc);
-    wc.hInstance = hinstance;
-    wc.hCursor = unsafe { LoadCursorW(None, IDC_ARROW).unwrap_or_default() };
-    wc.hbrBackground = windows::Win32::Graphics::Gdi::HBRUSH(
-        (COLOR_WINDOW.0 + 1) as *mut core::ffi::c_void,
-    );
-    wc.lpszClassName = cls;
+    let wc = WNDCLASSEXW {
+        cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
+        style: windows::Win32::UI::WindowsAndMessaging::WNDCLASS_STYLES(
+            windows::Win32::UI::WindowsAndMessaging::CS_HREDRAW.0
+                | windows::Win32::UI::WindowsAndMessaging::CS_VREDRAW.0,
+        ),
+        lpfnWndProc: Some(main_wndproc),
+        hInstance: hinstance,
+        hCursor: unsafe { LoadCursorW(None, IDC_ARROW).unwrap_or_default() },
+        hbrBackground: windows::Win32::Graphics::Gdi::HBRUSH(
+            (COLOR_WINDOW.0 + 1) as *mut core::ffi::c_void,
+        ),
+        lpszClassName: cls,
+        ..Default::default()
+    };
     unsafe {
         RegisterClassExW(&wc);
     }
@@ -253,8 +255,14 @@ fn create_children(st: &mut GuiState, hinstance: HINSTANCE) {
             w!("STATIC"),
             banner_text,
             window_style(WS_CHILD.0 | WS_VISIBLE.0),
-            0, 0, 10, 10,
-            Some(st.main), None, Some(hinstance), None,
+            0,
+            0,
+            10,
+            10,
+            Some(st.main),
+            None,
+            Some(hinstance),
+            None,
         )
         .expect("create banner")
     };
@@ -266,10 +274,21 @@ fn create_children(st: &mut GuiState, hinstance: HINSTANCE) {
             w!("SysListView32"),
             w!("服务列表"),
             window_style(
-                WS_CHILD.0 | WS_VISIBLE.0 | WS_TABSTOP.0 | LVS_REPORT | LVS_SINGLESEL | LVS_SHOWSELALWAYS,
+                WS_CHILD.0
+                    | WS_VISIBLE.0
+                    | WS_TABSTOP.0
+                    | LVS_REPORT
+                    | LVS_SINGLESEL
+                    | LVS_SHOWSELALWAYS,
             ),
-            0, 0, 10, 10,
-            Some(st.main), Some(HMENU(COL_NAME as usize as *mut _)), Some(hinstance), None,
+            0,
+            0,
+            10,
+            10,
+            Some(st.main),
+            Some(HMENU(COL_NAME as usize as *mut _)),
+            Some(hinstance),
+            None,
         )
         .expect("create listview")
     };
@@ -295,9 +314,19 @@ fn create_children(st: &mut GuiState, hinstance: HINSTANCE) {
             windows::Win32::UI::WindowsAndMessaging::WINDOW_EX_STYLE(0),
             w!("BUTTON"),
             w!("服务详情"),
-            window_style(WS_CHILD.0 | WS_VISIBLE.0 | windows::Win32::UI::WindowsAndMessaging::BS_GROUPBOX as u32),
-            0, 0, 10, 10,
-            Some(st.main), None, Some(hinstance), None,
+            window_style(
+                WS_CHILD.0
+                    | WS_VISIBLE.0
+                    | windows::Win32::UI::WindowsAndMessaging::BS_GROUPBOX as u32,
+            ),
+            0,
+            0,
+            10,
+            10,
+            Some(st.main),
+            None,
+            Some(hinstance),
+            None,
         )
         .expect("create group")
     };
@@ -307,13 +336,22 @@ fn create_children(st: &mut GuiState, hinstance: HINSTANCE) {
             w!("EDIT"),
             w!(""),
             window_style(
-                WS_CHILD.0 | WS_VISIBLE.0 | WS_TABSTOP.0 | WS_VSCROLL.0
+                WS_CHILD.0
+                    | WS_VISIBLE.0
+                    | WS_TABSTOP.0
+                    | WS_VSCROLL.0
                     | windows::Win32::UI::WindowsAndMessaging::ES_MULTILINE as u32
                     | windows::Win32::UI::WindowsAndMessaging::ES_READONLY as u32
                     | windows::Win32::UI::WindowsAndMessaging::ES_AUTOVSCROLL as u32,
             ),
-            0, 0, 10, 10,
-            Some(st.main), None, Some(hinstance), None,
+            0,
+            0,
+            10,
+            10,
+            Some(st.main),
+            None,
+            Some(hinstance),
+            None,
         )
         .expect("create details")
     };
@@ -341,11 +379,19 @@ fn create_children(st: &mut GuiState, hinstance: HINSTANCE) {
                 w!("BUTTON"),
                 PCWSTR::from_raw(wide_label.as_ptr()),
                 window_style(
-                    WS_CHILD.0 | WS_VISIBLE.0 | WS_TABSTOP.0
+                    WS_CHILD.0
+                        | WS_VISIBLE.0
+                        | WS_TABSTOP.0
                         | windows::Win32::UI::WindowsAndMessaging::BS_PUSHBUTTON as u32,
                 ),
-                0, 0, 10, 10,
-                Some(st.main), Some(HMENU(id as usize as *mut _)), Some(hinstance), None,
+                0,
+                0,
+                10,
+                10,
+                Some(st.main),
+                Some(HMENU(id as usize as *mut _)),
+                Some(hinstance),
+                None,
             )
             .expect("create button")
         };
@@ -354,13 +400,40 @@ fn create_children(st: &mut GuiState, hinstance: HINSTANCE) {
 
     // Common font for every child control.
     for (_, h) in &st.btns {
-        unsafe { SendMessageW(*h, WM_SETFONT, Some(WPARAM(st.hfont.0 as usize)), Some(LPARAM(1))) };
+        unsafe {
+            SendMessageW(
+                *h,
+                WM_SETFONT,
+                Some(WPARAM(st.hfont.0 as usize)),
+                Some(LPARAM(1)),
+            )
+        };
     }
     unsafe {
-        SendMessageW(st.banner, WM_SETFONT, Some(WPARAM(st.hfont.0 as usize)), Some(LPARAM(1)));
-        SendMessageW(st.list, WM_SETFONT, Some(WPARAM(st.hfont.0 as usize)), Some(LPARAM(1)));
-        SendMessageW(st.group, WM_SETFONT, Some(WPARAM(st.hfont.0 as usize)), Some(LPARAM(1)));
-        SendMessageW(st.details, WM_SETFONT, Some(WPARAM(st.hfont.0 as usize)), Some(LPARAM(1)));
+        SendMessageW(
+            st.banner,
+            WM_SETFONT,
+            Some(WPARAM(st.hfont.0 as usize)),
+            Some(LPARAM(1)),
+        );
+        SendMessageW(
+            st.list,
+            WM_SETFONT,
+            Some(WPARAM(st.hfont.0 as usize)),
+            Some(LPARAM(1)),
+        );
+        SendMessageW(
+            st.group,
+            WM_SETFONT,
+            Some(WPARAM(st.hfont.0 as usize)),
+            Some(LPARAM(1)),
+        );
+        SendMessageW(
+            st.details,
+            WM_SETFONT,
+            Some(WPARAM(st.hfont.0 as usize)),
+            Some(LPARAM(1)),
+        );
     }
 }
 
@@ -390,15 +463,24 @@ unsafe fn layout(st: &GuiState, cw: i32, ch: i32) {
 
 // -------------------------------------------------------------- wndproc --
 
-unsafe extern "system" fn main_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+unsafe extern "system" fn main_wndproc(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
     let p = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut GuiState;
     if p.is_null() {
         return DefWindowProcW(hwnd, msg, wparam, lparam);
     }
     let st = &mut *p;
-    match msg {
+    let out = match msg {
         WM_SIZE => {
-            layout(st, (lparam.0 & 0xffff) as i32, ((lparam.0 >> 16) & 0xffff) as i32);
+            layout(
+                st,
+                (lparam.0 & 0xffff) as i32,
+                ((lparam.0 >> 16) & 0xffff) as i32,
+            );
             LRESULT(0)
         }
         WM_COMMAND => {
@@ -426,11 +508,22 @@ unsafe extern "system" fn main_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lpa
             LRESULT(0)
         }
         WM_DESTROY => {
+            let _ = KillTimer(Some(hwnd), 1);
             PostQuitMessage(0);
             LRESULT(0)
         }
         _ => DefWindowProcW(hwnd, msg, wparam, lparam),
+    };
+    if msg == WM_DESTROY {
+        // Reclaim the GuiState box after the match arm (whose borrow of it
+        // has ended) and detach it from the window so no further message can
+        // reach freed memory.
+        unsafe {
+            SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
+            drop(Box::from_raw(p));
+        }
     }
+    out
 }
 
 unsafe fn on_notify(st: &mut GuiState, lparam: LPARAM) -> LRESULT {
@@ -463,7 +556,10 @@ unsafe fn on_command(st: &mut GuiState, id: u32) {
 }
 
 fn is_op_button(id: u32) -> bool {
-    matches!(id, ID_START | ID_STOP | ID_RESTART | ID_PAUSE | ID_CONTINUE | ID_REMOVE)
+    matches!(
+        id,
+        ID_START | ID_STOP | ID_RESTART | ID_PAUSE | ID_CONTINUE | ID_REMOVE
+    )
 }
 
 // ------------------------------------------------------------- selection --
@@ -498,7 +594,9 @@ fn enumerate() -> Vec<SvcEntry> {
     };
     let mut out: Vec<SvcEntry> = Vec::new();
     for name in services.enum_keys().flatten() {
-        let Ok(k) = services.open_subkey(&name) else { continue };
+        let Ok(k) = services.open_subkey(&name) else {
+            continue;
+        };
         let image = k.get_value::<String, _>("ImagePath").unwrap_or_default();
         let img_lc = image.to_lowercase();
         let is_rssvc = img_lc.contains("rssvc.exe");
@@ -523,7 +621,7 @@ fn enumerate() -> Vec<SvcEntry> {
             cfg,
         });
     }
-    out.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+    out.sort_by_key(|a| a.name.to_lowercase());
     out
 }
 
@@ -536,11 +634,20 @@ unsafe fn rebuild_list(st: &mut GuiState) {
     };
 
     st.entries = enumerate();
-    SendMessageW(st.list, LVM_DELETEALLITEMS, Some(WPARAM(0)), Some(LPARAM(0)));
+    SendMessageW(
+        st.list,
+        LVM_DELETEALLITEMS,
+        Some(WPARAM(0)),
+        Some(LPARAM(0)),
+    );
     for (i, e) in st.entries.iter().enumerate() {
         lv_insert_row(st.list, i as i32, i, &e.name);
         lv_set_text(st.list, i as i32, COL_KIND, e.kind);
-        let app = e.cfg.as_ref().map(|c| c.application.clone()).unwrap_or_default();
+        let app = e
+            .cfg
+            .as_ref()
+            .map(|c| c.application.clone())
+            .unwrap_or_default();
         lv_set_text(st.list, i as i32, COL_APP, &app);
     }
     refresh_statuses(st);
@@ -558,9 +665,12 @@ unsafe fn refresh_statuses(st: &mut GuiState) {
     if st.entries.is_empty() {
         return;
     }
-    let Ok(scm) = crate::scm::open_manager_read() else { return };
+    let Ok(scm) = crate::scm::open_manager_read() else {
+        return;
+    };
     for (i, e) in st.entries.iter().enumerate() {
-        let (state_s, pid) = match crate::scm::open_service(scm, &e.name, crate::scm::ACCESS_QUERY) {
+        let (state_s, pid) = match crate::scm::open_service(scm, &e.name, crate::scm::ACCESS_QUERY)
+        {
             Ok(svc) => match crate::scm::query_status_ex(&svc) {
                 Ok(s) => (state_text(s.state).to_string(), s.pid),
                 Err(_) => ("?".to_string(), 0),
@@ -573,7 +683,16 @@ unsafe fn refresh_statuses(st: &mut GuiState) {
             ("-".to_string(), "-".to_string())
         };
         lv_set_text(st.list, i as i32, COL_STATE, &state_s);
-        lv_set_text(st.list, i as i32, COL_PID, &if pid != 0 { pid.to_string() } else { "-".to_string() });
+        lv_set_text(
+            st.list,
+            i as i32,
+            COL_PID,
+            &if pid != 0 {
+                pid.to_string()
+            } else {
+                "-".to_string()
+            },
+        );
         lv_set_text(st.list, i as i32, COL_MEM, &mem);
         lv_set_text(st.list, i as i32, COL_UPTIME, &up);
     }
@@ -602,7 +721,10 @@ fn detail_text(e: &SvcEntry) -> String {
     if !e.display.is_empty() {
         s.push_str(&format!("显示名称:  {}\r\n", e.display));
     }
-    s.push_str(&format!("管理器:    {} (由 {} install 安装)\r\n", e.kind, e.kind));
+    s.push_str(&format!(
+        "管理器:    {} (由 {} install 安装)\r\n",
+        e.kind, e.kind
+    ));
     if let Some(c) = &e.cfg {
         s.push_str(&format!("启动类型:  {}\r\n", c.startup_name()));
         if !c.account.is_empty() {
@@ -641,7 +763,10 @@ fn detail_text(e: &SvcEntry) -> String {
         ));
         s.push_str(&format!(
             "停止策略:  跳过掩码 {} / 超时 {}-{}-{} ms (控制台-窗口-线程)\r\n",
-            c.stop_method_skip, c.stop_timeout_console, c.stop_timeout_window, c.stop_timeout_threads
+            c.stop_method_skip,
+            c.stop_timeout_console,
+            c.stop_timeout_window,
+            c.stop_timeout_threads
         ));
         if !c.dependencies.is_empty() {
             s.push_str(&format!("依赖服务:  {}\r\n", c.dependencies.join(", ")));
@@ -670,7 +795,12 @@ unsafe fn update_details(st: &mut GuiState) {
         String::from("（未选中服务）在上方列表中选择一个服务查看详情；\r\n操作按钮（启动/停止/...）也依赖此处选中项。")
     };
     let w = util::to_wide(&text);
-    SendMessageW(st.details, windows::Win32::UI::WindowsAndMessaging::WM_SETTEXT, Some(WPARAM(0)), Some(LPARAM(w.as_ptr() as isize)));
+    SendMessageW(
+        st.details,
+        windows::Win32::UI::WindowsAndMessaging::WM_SETTEXT,
+        Some(WPARAM(0)),
+        Some(LPARAM(w.as_ptr() as isize)),
+    );
     let has = idx >= 0 && !st.busy;
     for (id, h) in &st.btns {
         if is_op_button(*id) {
@@ -685,7 +815,9 @@ fn begin_op(st: &mut GuiState, op: u32) {
     if st.busy {
         return;
     }
-    let Some(entry) = selected_entry(st) else { return };
+    let Some(entry) = selected_entry(st) else {
+        return;
+    };
     st.busy = true;
     for (id, h) in &st.btns {
         if is_op_button(*id) {
@@ -701,19 +833,16 @@ fn confirm_remove(st: &mut GuiState) {
     if st.busy {
         return;
     }
-    let Some(entry) = selected_entry(st) else { return };
-    let text = format!("确认删除服务 \"{}\" ？\n\n正在运行的服务会先被停止（温和停止序列），然后从系统中移除。", entry.name);
-    let wtext = util::to_wide(&text);
-    let cap = util::to_wide("rssvc 删除确认");
-    let r = unsafe {
-        MessageBoxW(
-            Some(st.main),
-            PCWSTR::from_raw(wtext.as_ptr()),
-            PCWSTR::from_raw(cap.as_ptr()),
-            MB_OKCANCEL | MB_ICONWARNING,
-        )
+    let Some(entry) = selected_entry(st) else {
+        return;
     };
-    if r.0 == IDYES_RAW {
+    let text = format!(
+        "确认删除服务 \"{}\" ？\n\n正在运行的服务会先被停止（温和停止序列），然后从系统中移除。",
+        entry.name
+    );
+    // MB_YESNO + IDYES via the shared helper (an MB_OKCANCEL box returns
+    // IDOK/IDCANCEL and would never match an IDYES comparison).
+    if ctl::ask_yes_no(st.main, &text, "rssvc 删除确认") {
         begin_op(st, OP_DELETE);
     }
 }
@@ -724,14 +853,21 @@ fn spawn_op(main: HWND, name: String, op: u32) {
     std::thread::spawn(move || {
         let main = HWND(main_addr as *mut core::ffi::c_void);
         let res = run_op(&name, op);
-        let _ = unsafe {
+        let lp = Box::into_raw(Box::new(res));
+        let sent = unsafe {
             PostMessageW(
                 Some(main),
                 WM_APP_OP_DONE,
                 WPARAM(op as usize),
-                LPARAM(Box::into_raw(Box::new(res)) as isize),
+                LPARAM(lp as isize),
             )
         };
+        if sent.is_err() {
+            // The window is gone (or delivery failed): nobody will free the
+            // payload through WM_APP_OP_DONE, so reclaim it here. Ownership
+            // is transferred exactly once — no double-free is possible.
+            drop(unsafe { Box::from_raw(lp) });
+        }
     });
 }
 
@@ -740,7 +876,11 @@ fn run_op(name: &str, op: u32) -> Result<String, String> {
     let res = (|| -> Result<String, String> {
         match op {
             OP_START => {
-                let svc = crate::scm::open_service(scm, name, crate::scm::ACCESS_START | crate::scm::ACCESS_QUERY)?;
+                let svc = crate::scm::open_service(
+                    scm,
+                    name,
+                    crate::scm::ACCESS_START | crate::scm::ACCESS_QUERY,
+                )?;
                 crate::scm::start(&svc)?;
                 if crate::scm::wait_for_state(&svc, crate::scm::STATE_RUNNING, 8000) {
                     Ok(format!("服务 {name} 已启动。"))
@@ -749,7 +889,11 @@ fn run_op(name: &str, op: u32) -> Result<String, String> {
                 }
             }
             OP_STOP => {
-                let svc = crate::scm::open_service(scm, name, crate::scm::ACCESS_STOP | crate::scm::ACCESS_QUERY)?;
+                let svc = crate::scm::open_service(
+                    scm,
+                    name,
+                    crate::scm::ACCESS_STOP | crate::scm::ACCESS_QUERY,
+                )?;
                 let cur = crate::scm::query_status(&svc)?;
                 if cur.dwCurrentState.0 == crate::scm::STATE_STOPPED {
                     return Ok(format!("服务 {name} 已是停止状态。"));
@@ -758,7 +902,9 @@ fn run_op(name: &str, op: u32) -> Result<String, String> {
                 if crate::scm::wait_for_state(&svc, crate::scm::STATE_STOPPED, 35_000) {
                     Ok(format!("服务 {name} 已停止。"))
                 } else {
-                    Err(format!("服务 {name} 停止超时(35 秒)，停止序列可能仍在进行，请稍后刷新查看。"))
+                    Err(format!(
+                        "服务 {name} 停止超时(35 秒)，停止序列可能仍在进行，请稍后刷新查看。"
+                    ))
                 }
             }
             OP_RESTART => {
@@ -782,7 +928,11 @@ fn run_op(name: &str, op: u32) -> Result<String, String> {
                 }
             }
             OP_PAUSE => {
-                let svc = crate::scm::open_service(scm, name, crate::scm::ACCESS_PAUSE | crate::scm::ACCESS_QUERY)?;
+                let svc = crate::scm::open_service(
+                    scm,
+                    name,
+                    crate::scm::ACCESS_PAUSE | crate::scm::ACCESS_QUERY,
+                )?;
                 crate::scm::control(&svc, crate::scm::CONTROL_PAUSE)?;
                 if crate::scm::wait_for_state(&svc, crate::scm::STATE_PAUSED, 15_000) {
                     Ok(format!("服务 {name} 已暂停（应用已停止，服务保持挂起）。"))
@@ -791,7 +941,11 @@ fn run_op(name: &str, op: u32) -> Result<String, String> {
                 }
             }
             OP_CONTINUE => {
-                let svc = crate::scm::open_service(scm, name, crate::scm::ACCESS_PAUSE | crate::scm::ACCESS_QUERY)?;
+                let svc = crate::scm::open_service(
+                    scm,
+                    name,
+                    crate::scm::ACCESS_PAUSE | crate::scm::ACCESS_QUERY,
+                )?;
                 crate::scm::control(&svc, crate::scm::CONTROL_CONTINUE)?;
                 if crate::scm::wait_for_state(&svc, crate::scm::STATE_RUNNING, 15_000) {
                     Ok(format!("服务 {name} 已恢复运行。"))
@@ -842,63 +996,102 @@ fn op_done(st: &mut GuiState, wparam: WPARAM, lparam: LPARAM) {
 // ------------------------------------------------------ viewer / editor / toml --
 
 fn open_logview(st: &mut GuiState) {
-    let Some(entry) = selected_entry(st) else { return };
+    let Some(entry) = selected_entry(st) else {
+        return;
+    };
     let Some(cfg) = entry.cfg.clone() else {
-        msg_box(st.main, "无法读取该服务的注册表配置。", "rssvc", MB_OK | MB_ICONERROR);
+        msg_box(
+            st.main,
+            "无法读取该服务的注册表配置。",
+            "rssvc",
+            MB_OK | MB_ICONERROR,
+        );
         return;
     };
     crate::log_view::open_log_viewer(st.main, &entry.name, &cfg);
 }
 
 fn open_editor(st: &mut GuiState) {
-    let Some(entry) = selected_entry(st) else { return };
+    let Some(entry) = selected_entry(st) else {
+        return;
+    };
     let Some(cfg) = entry.cfg.clone() else {
-        msg_box(st.main, "无法读取该服务的注册表配置。", "rssvc", MB_OK | MB_ICONERROR);
+        msg_box(
+            st.main,
+            "无法读取该服务的注册表配置。",
+            "rssvc",
+            MB_OK | MB_ICONERROR,
+        );
         return;
     };
     crate::edit_dlg::open_edit_dialog(st.main, entry.name, cfg);
 }
 
 fn export_toml(st: &mut GuiState) {
-    let Some(entry) = selected_entry(st) else { return };
+    let Some(entry) = selected_entry(st) else {
+        return;
+    };
     let Some(cfg) = entry.cfg.clone() else {
-        msg_box(st.main, "无法读取该服务的注册表配置。", "rssvc", MB_OK | MB_ICONERROR);
+        msg_box(
+            st.main,
+            "无法读取该服务的注册表配置。",
+            "rssvc",
+            MB_OK | MB_ICONERROR,
+        );
         return;
     };
     let default_name = format!("{}.toml", entry.name);
-    let Some(path) =
-        crate::ctl::pick_save(st.main, "导出服务配置为 TOML", &default_name)
+    let Some(path) = crate::ctl::pick_save(st.main, "导出服务配置为 TOML", &default_name)
     else {
         return;
     };
     let dump = match toml::to_string_pretty(&cfg) {
         Ok(s) => s,
         Err(e) => {
-            msg_box(st.main, &format!("TOML 序列化失败: {e}"), "rssvc 导出失败", MB_OK | MB_ICONERROR);
+            msg_box(
+                st.main,
+                &format!("TOML 序列化失败: {e}"),
+                "rssvc 导出失败",
+                MB_OK | MB_ICONERROR,
+            );
             return;
         }
     };
     match std::fs::write(&path, dump) {
         Ok(()) => msg_box(
             st.main,
-            &format!("配置已导出到:\n{path}\n\n可用 \"rssvc import\" 或 \"导入TOML\" 在其他机器还原。"),
+            &format!(
+                "配置已导出到:\n{path}\n\n可用 \"rssvc import\" 或 \"导入TOML\" 在其他机器还原。"
+            ),
             "rssvc 导出",
             MB_OK | MB_ICONINFORMATION,
         ),
-        Err(e) => msg_box(st.main, &format!("写入文件失败: {e}"), "rssvc 导出失败", MB_OK | MB_ICONERROR),
+        Err(e) => msg_box(
+            st.main,
+            &format!("写入文件失败: {e}"),
+            "rssvc 导出失败",
+            MB_OK | MB_ICONERROR,
+        ),
     }
 }
 
 fn import_toml(st: &mut GuiState) {
-    let Some(path) =
-        crate::ctl::pick_open(st.main, "选择要导入的 TOML 配置文件", crate::ctl::PickMode::Any)
-    else {
+    let Some(path) = crate::ctl::pick_open(
+        st.main,
+        "选择要导入的 TOML 配置文件",
+        crate::ctl::PickMode::Any,
+    ) else {
         return;
     };
     let text = match std::fs::read_to_string(&path) {
         Ok(t) => t,
         Err(e) => {
-            msg_box(st.main, &format!("读取文件失败: {e}"), "rssvc 导入失败", MB_OK | MB_ICONERROR);
+            msg_box(
+                st.main,
+                &format!("读取文件失败: {e}"),
+                "rssvc 导入失败",
+                MB_OK | MB_ICONERROR,
+            );
             return;
         }
     };
@@ -1086,8 +1279,12 @@ fn proc_uptime(pid: u32) -> String {
         let Ok(h) = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) else {
             return "-".to_string();
         };
-        let (mut c, mut e, mut k, mut u) =
-            (FILETIME::default(), FILETIME::default(), FILETIME::default(), FILETIME::default());
+        let (mut c, mut e, mut k, mut u) = (
+            FILETIME::default(),
+            FILETIME::default(),
+            FILETIME::default(),
+            FILETIME::default(),
+        );
         let ok = GetProcessTimes(h, &mut c, &mut e, &mut k, &mut u).is_ok();
         let _ = CloseHandle(h);
         if !ok {

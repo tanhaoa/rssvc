@@ -3,36 +3,37 @@
 
 use std::collections::BTreeMap;
 use std::path::Path;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
+use windows::core::{w, PCWSTR, PWSTR};
 use windows::Win32::Foundation::{
-    CloseHandle, GENERIC_READ, GENERIC_WRITE, HANDLE, HANDLE_FLAG_INHERIT, HANDLE_FLAGS,
-    LPARAM, WAIT_OBJECT_0, WPARAM,
+    CloseHandle, GENERIC_READ, GENERIC_WRITE, HANDLE, HANDLE_FLAGS, HANDLE_FLAG_INHERIT, LPARAM,
+    WAIT_OBJECT_0, WPARAM,
 };
+use windows::Win32::Security::SECURITY_ATTRIBUTES;
 use windows::Win32::Storage::FileSystem::{
     CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
 };
-use windows::Win32::Security::SECURITY_ATTRIBUTES;
 use windows::Win32::System::Console::{
-    AttachConsole, FreeConsole, GenerateConsoleCtrlEvent, SetConsoleCtrlHandler, CTRL_BREAK_EVENT,
+    AttachConsole, FreeConsole, GenerateConsoleCtrlEvent, GetConsoleWindow, SetConsoleCtrlHandler,
+    ATTACH_PARENT_PROCESS, CTRL_BREAK_EVENT,
 };
 use windows::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, Thread32First, Thread32Next,
     PROCESSENTRY32W, TH32CS_SNAPPROCESS, TH32CS_SNAPTHREAD, THREADENTRY32,
 };
 use windows::Win32::System::JobObjects::{
-    AssignProcessToJobObject, CreateJobObjectW, SetInformationJobObject, TerminateJobObject,
-    JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
-    JobObjectExtendedLimitInformation,
+    AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
+    SetInformationJobObject, TerminateJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+    JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
 };
 use windows::Win32::System::Pipes::CreatePipe;
-use windows::core::{w, PCWSTR, PWSTR};
 use windows::Win32::System::Threading::{
     CreateProcessW, GetExitCodeProcess, ResumeThread, SetPriorityClass, TerminateProcess,
     WaitForMultipleObjects, WaitForSingleObject, ABOVE_NORMAL_PRIORITY_CLASS,
     BELOW_NORMAL_PRIORITY_CLASS, CREATE_NEW_PROCESS_GROUP, CREATE_NO_WINDOW, CREATE_SUSPENDED,
-    CREATE_UNICODE_ENVIRONMENT, HIGH_PRIORITY_CLASS, IDLE_PRIORITY_CLASS,
-    NORMAL_PRIORITY_CLASS, PROCESS_CREATION_FLAGS, STARTF_USESTDHANDLES, STARTUPINFOW,
+    CREATE_UNICODE_ENVIRONMENT, HIGH_PRIORITY_CLASS, IDLE_PRIORITY_CLASS, NORMAL_PRIORITY_CLASS,
+    PROCESS_CREATION_FLAGS, STARTF_USESTDHANDLES, STARTUPINFOW,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     EnumWindows, GetWindowThreadProcessId, IsWindowVisible, PostMessageW, PostThreadMessageW,
@@ -85,10 +86,17 @@ fn priority_class(p: u32) -> PROCESS_CREATION_FLAGS {
 
 /// Build the UTF-16 environment block: current process environment plus the
 /// configured overrides (KEY=VALUE entries, case-insensitive replacement).
+///
+/// Uses `vars_os` + lossy conversion: `env::vars()` panics on non-UTF-8
+/// entries, which would kill the whole service (panic = "abort" in release).
+/// A non-Unicode variable keeps its lossy-decoded name/value instead.
 fn build_env_block(extra: &[String]) -> Vec<u16> {
     let mut map: BTreeMap<String, String> = BTreeMap::new();
-    for (k, v) in std::env::vars() {
-        map.insert(k.to_lowercase(), v);
+    for (k, v) in std::env::vars_os() {
+        map.insert(
+            k.to_string_lossy().to_lowercase(),
+            v.to_string_lossy().to_string(),
+        );
     }
     for e in extra {
         if let Some(eq) = e.find('=') {
@@ -105,7 +113,12 @@ fn build_env_block(extra: &[String]) -> Vec<u16> {
         block.extend(v.encode_utf16());
         block.push(0);
     }
+    // Double-NUL terminator; a fully empty environment block is still two
+    // NUL units wide.
     block.push(0);
+    if map.is_empty() {
+        block.push(0);
+    }
     block
 }
 
@@ -143,7 +156,7 @@ pub fn spawn(cfg: &Config, logger: &Logger) -> Result<Child, String> {
         };
 
         // NUL device for unused stdio slots.
-        let nul: HANDLE = match CreateFileW(
+        let nul: HANDLE = CreateFileW(
             w!("NUL"),
             GENERIC_READ.0 | GENERIC_WRITE.0,
             FILE_SHARE_READ | FILE_SHARE_WRITE,
@@ -151,10 +164,8 @@ pub fn spawn(cfg: &Config, logger: &Logger) -> Result<Child, String> {
             OPEN_EXISTING,
             FILE_ATTRIBUTE_NORMAL,
             None,
-        ) {
-            Ok(h) => h,
-            Err(_) => HANDLE::default(),
-        };
+        )
+        .unwrap_or_default();
 
         // stdout / stderr targets.
         let mut out_r = HANDLE::default();
@@ -183,12 +194,14 @@ pub fn spawn(cfg: &Config, logger: &Logger) -> Result<Child, String> {
             );
         }
 
-        let mut si = STARTUPINFOW::default();
-        si.cb = std::mem::size_of::<STARTUPINFOW>() as u32;
-        si.dwFlags = STARTF_USESTDHANDLES;
-        si.hStdInput = nul;
-        si.hStdOutput = if !out_w.is_invalid() { out_w } else { nul };
-        si.hStdError = if !err_w.is_invalid() { err_w } else { nul };
+        let si = STARTUPINFOW {
+            cb: std::mem::size_of::<STARTUPINFOW>() as u32,
+            dwFlags: STARTF_USESTDHANDLES,
+            hStdInput: nul,
+            hStdOutput: if !out_w.is_invalid() { out_w } else { nul },
+            hStdError: if !err_w.is_invalid() { err_w } else { nul },
+            ..Default::default()
+        };
 
         // Command line.
         let cmdline = format!("{} {}", util::quote_path(&app), cfg.app_parameters.trim());
@@ -255,7 +268,10 @@ pub fn spawn(cfg: &Config, logger: &Logger) -> Result<Child, String> {
         )
         .map_err(|e| format!("SetInformationJobObject 失败: {}", util::last_error(&e)))?;
         if let Err(e) = AssignProcessToJobObject(pi.hProcess, job) {
-            logger.service_line(&format!("warning: AssignProcessToJobObject 失败: {}", util::last_error(&e)));
+            logger.service_line(&format!(
+                "warning: AssignProcessToJobObject 失败: {}",
+                util::last_error(&e)
+            ));
         }
 
         let _ = SetPriorityClass(pi.hProcess, priority_class(cfg.priority));
@@ -265,14 +281,26 @@ pub fn spawn(cfg: &Config, logger: &Logger) -> Result<Child, String> {
         let mut readers = Vec::new();
         if !out_r.is_invalid() {
             if let Some(w) = logger.clone_out_writer() {
-                readers.push(spawn_pipe_reader(crate::util::SharedHandle(out_r), w));
+                match spawn_pipe_reader(crate::util::SharedHandle(out_r), w) {
+                    Some(h) => readers.push(h),
+                    None => {
+                        let _ = CloseHandle(out_r);
+                        logger.service_line("warning: stdout 读取线程创建失败, 该流日志将被丢弃");
+                    }
+                }
             } else {
                 let _ = CloseHandle(out_r);
             }
         }
         if !err_r.is_invalid() {
             if let Some(w) = logger.clone_err_writer() {
-                readers.push(spawn_pipe_reader(crate::util::SharedHandle(err_r), w));
+                match spawn_pipe_reader(crate::util::SharedHandle(err_r), w) {
+                    Some(h) => readers.push(h),
+                    None => {
+                        let _ = CloseHandle(err_r);
+                        logger.service_line("warning: stderr 读取线程创建失败, 该流日志将被丢弃");
+                    }
+                }
             } else {
                 let _ = CloseHandle(err_r);
             }
@@ -290,16 +318,17 @@ pub fn spawn(cfg: &Config, logger: &Logger) -> Result<Child, String> {
 }
 
 /// Wait until any of the handles is signaled; returns the 0-based index.
-pub fn wait_any(handles: &[HANDLE]) -> usize {
+/// Returns `None` when the wait itself fails (e.g. an invalid handle) — the
+/// caller is expected to fail in a controlled way instead of spinning.
+pub fn wait_any(handles: &[HANDLE]) -> Option<usize> {
     unsafe {
-        loop {
-            let r = WaitForMultipleObjects(handles, false, u32::MAX);
-            let base = WAIT_OBJECT_0.0;
-            if r.0 >= base && r.0 < base + handles.len() as u32 {
-                return (r.0 - base) as usize;
-            }
-            // WAIT_FAILED should not happen; avoid a hot loop.
-            std::thread::sleep(Duration::from_millis(100));
+        let r = WaitForMultipleObjects(handles, false, u32::MAX);
+        let base = WAIT_OBJECT_0.0;
+        if r.0 >= base && r.0 < base + handles.len() as u32 {
+            Some((r.0 - base) as usize)
+        } else {
+            // WAIT_FAILED (WAIT_TIMEOUT is impossible with INFINITE).
+            None
         }
     }
 }
@@ -314,15 +343,12 @@ pub fn has_exited(handle: HANDLE) -> bool {
     unsafe { WaitForSingleObject(handle, 0) == WAIT_OBJECT_0 }
 }
 
-/// Exit code of an exited process (0 if it could not be read).
-pub fn exit_code(handle: HANDLE) -> u32 {
+/// Exit code of an exited process. `None` when GetExitCodeProcess fails —
+/// callers must log this instead of silently treating it as success.
+pub fn exit_code(handle: HANDLE) -> Option<u32> {
     unsafe {
         let mut code: u32 = 0;
-        if GetExitCodeProcess(handle, &mut code).is_ok() {
-            code
-        } else {
-            0
-        }
+        GetExitCodeProcess(handle, &mut code).ok().map(|_| code)
     }
 }
 
@@ -335,8 +361,10 @@ fn descendant_pids(root: u32) -> Vec<u32> {
             Err(_) => return pids,
         };
         let mut all: Vec<(u32, u32)> = Vec::new(); // (pid, ppid)
-        let mut entry = PROCESSENTRY32W::default();
-        entry.dwSize = std::mem::size_of::<PROCESSENTRY32W>() as u32;
+        let mut entry = PROCESSENTRY32W {
+            dwSize: std::mem::size_of::<PROCESSENTRY32W>() as u32,
+            ..Default::default()
+        };
         if Process32FirstW(snap, &mut entry).is_ok() {
             loop {
                 all.push((entry.th32ProcessID, entry.th32ParentProcessID));
@@ -370,8 +398,10 @@ fn thread_ids_of(pids: &[u32]) -> Vec<u32> {
             Ok(h) => h,
             Err(_) => return tids,
         };
-        let mut entry = THREADENTRY32::default();
-        entry.dwSize = std::mem::size_of::<THREADENTRY32>() as u32;
+        let mut entry = THREADENTRY32 {
+            dwSize: std::mem::size_of::<THREADENTRY32>() as u32,
+            ..Default::default()
+        };
         if Thread32First(snap, &mut entry).is_ok() {
             loop {
                 if pids.contains(&entry.th32OwnerProcessID) {
@@ -389,18 +419,34 @@ fn thread_ids_of(pids: &[u32]) -> Vec<u32> {
 }
 
 /// Attach to the child's console and send CTRL_BREAK to its process group.
+///
+/// Best effort about restoring the original console state: if we owned a
+/// console before (debugging context), re-attach to the parent afterwards.
+/// A service process normally has no console at all, so both FreeConsole
+/// calls are no-ops there.
 fn send_ctrl_break(pid: u32) -> bool {
     unsafe {
+        let had_console = !GetConsoleWindow().0.is_null();
         // A service process has no console; attaching to the child's own
         // console lets us target its process group.
-        let _ = FreeConsole();
+        if had_console {
+            let _ = FreeConsole();
+        }
         if AttachConsole(pid).is_err() {
+            // Could not attach (child has no console / exited). If we came
+            // with our own console, get it back.
+            if had_console {
+                let _ = AttachConsole(ATTACH_PARENT_PROCESS);
+            }
             return false;
         }
         // Ignore the event ourselves so it does not kill this process.
         let _ = SetConsoleCtrlHandler(None, true);
         let ok = GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT, pid).is_ok();
         let _ = FreeConsole();
+        if had_console {
+            let _ = AttachConsole(ATTACH_PARENT_PROCESS);
+        }
         ok
     }
 }
@@ -423,10 +469,17 @@ unsafe extern "system" fn enum_close_wnd(
 ///   2. WM_CLOSE to visible windows of the tree  (timeout: stop_timeout_window)
 ///   3. WM_QUIT to threads of the tree           (timeout: stop_timeout_threads)
 ///   4. TerminateJobObject - kills the whole tree instantly
+///
 /// Levels can be skipped via cfg.stop_method_skip (bit 1/2/4/8).
 pub fn stop_child(child: &mut Child, cfg: &Config, logger: &Logger, shutdown: bool) {
     if has_exited(child.process) {
         logger.service_line("application already exited");
+        // Even on the early-exit path the pipe reader threads must be
+        // drained: they may still hold the tail of the application's output
+        // (EOF arrives once every write end is closed by Child::drop).
+        for h in child.readers.drain(..) {
+            let _ = h.join();
+        }
         return;
     }
     let scale = |t: u32| if shutdown { t.min(2000) } else { t };
@@ -449,7 +502,7 @@ pub fn stop_child(child: &mut Child, cfg: &Config, logger: &Logger, shutdown: bo
             logger.service_line("CTRL_BREAK unavailable (no console), skipping");
         }
     }
-    if !exited && skip & SKIP_WINDOW == 0 && pids.len() > 0 {
+    if !exited && skip & SKIP_WINDOW == 0 && !pids.is_empty() {
         unsafe {
             let lparam = LPARAM(&pids as *const Vec<u32> as isize);
             let _ = EnumWindows(Some(enum_close_wnd), lparam);
@@ -490,5 +543,28 @@ pub fn stop_child(child: &mut Child, cfg: &Config, logger: &Logger, shutdown: bo
     // is gone (job close in Child::drop guarantees this).
     for h in child.readers.drain(..) {
         let _ = h.join();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn env_block_applies_overrides_case_insensitively() {
+        std::env::set_var("RSSVC_TEST_VAR", "base");
+        let block = build_env_block(&["RSSVC_TEST_VAR=override".to_string()]);
+        let text = String::from_utf16_lossy(&block);
+        assert!(text.contains("RSSVC_TEST_VAR=override"));
+        // The inherited entry is replaced (case-insensitive key match).
+        assert!(!text.contains("rssvc_test_var=base"));
+    }
+
+    #[test]
+    fn env_block_always_double_nul_terminated() {
+        let block = build_env_block(&[]);
+        assert!(block.len() >= 2);
+        assert_eq!(block.len() % 2, 0);
+        assert_eq!(&block[block.len() - 2..], &[0u16, 0u16]);
     }
 }

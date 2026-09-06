@@ -29,17 +29,17 @@ fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
 
     // The SCM launches us as: rssvc.exe <service-name>
-    // A single argument that is not a known CLI command is treated as a
-    // potential service name; if we are not running under the SCM the
-    // dispatcher fails with ERROR_FAILED_SERVICE_CONTROLLER_CONNECT and we
-    // fall back to CLI mode (this mirrors what nssm does).
-    if args.len() == 1 && !cli::is_known_command(&args[0]) {
-        if service::try_dispatch(args[0].clone()) {
-            return; // ran as a service (or failed hard while doing so)
-        }
-        // Not a service context -> fall through to CLI, which will print an
-        // "unknown command" error for this token.
+    // Any single-argument launch may be a service start, so try the service
+    // dispatcher FIRST — even when the name collides with a CLI command (a
+    // service literally named "gui" or "start" is perfectly legal and must
+    // be startable). In a console context StartServiceCtrlDispatcher fails
+    // fast with ERROR_FAILED_SERVICE_CONTROLLER_CONNECT and we fall through
+    // to the CLI, which mirrors what nssm does.
+    if args.len() == 1 && service::try_dispatch(args[0].clone()) {
+        return; // ran as a service (or failed hard while doing so)
     }
+    // Not a service context -> fall through to CLI, which will print an
+    // "unknown command" error / usage for this token.
 
     // Double-clicked from Explorer (no args, we own the fresh console):
     // open the GUI manager instead of printing help to a console that will
